@@ -1,7 +1,7 @@
 DB_HOST=192.250.235.126
 DB_PORT=3306
 DB_USER=mangotracking_app
-DB_PASSWORD=your-cpanel-database-password
+DB_PASSWORD=Sok@$_2015
 DB_NAME=mangotracking_app_hosting
 
 DEFAULT_COMPANY_ID=1
