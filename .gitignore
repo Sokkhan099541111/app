@@ -1,0 +1,38 @@
+# --- Secrets: never commit these ---------------------------------------
+.env
+*.env
+!*.env.example
+app/.env
+app/uploads/logos/*
+
+# --- Python ------------------------------------------------------------
+**/__pycache__/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Node / frontend ---------------------------------------------------
+node_modules/
+dist/
+.vite/
+*.local
+
+# --- Editors / OS ------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Build & temp artefacts -------------------------------------------
+*.log
+_preview/
+_preview2/
+
+# Deployment bundles -- regenerate with "npm run build" instead of
+# committing them. They are large and change on every build.
+frontend-build.zip
+Archive.zip
+*.zip

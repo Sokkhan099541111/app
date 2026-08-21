@@ -1,0 +1,11 @@
+//looking resource ID
+https://hst-api.wialon.com/wialon/ajax.html?svc=core/search_items&params={"spec":{"itemsType":"avl_resource","propName":"sys_name","propValueMask":"*","sortType":"sys_name"},"force":1,"flags":1,"from":0,"to":0}&sid=your_session_id
+tempalte report ID
+https://hst-api.wialon.com/wialon/ajax.html?svc=core/search_items&params={"spec":{"itemsType":"avl_resource","propType":"propitemname","propName":"reporttemplates","propValueMask":"*","sortType":"sys_name"},"force":1,"flags":8193,"from":0,"to":0}&sid=your_session_id
+objectID as the group
+https://hst-api.wialon.com/wialon/ajax.html?svc=core/search_items&params={"spec":{"itemsType":"avl_unit_group","propName":"sys_name","propValueMask":"*","sortType":"sys_name"},"force":1,"flags":1,"from":0,"to":0}&sid=your_session_id
+
+
+// Database credentials are NOT kept here.
+// They live in app/.env, which is excluded from git.
+// See app/.env.example for the required variable names.
