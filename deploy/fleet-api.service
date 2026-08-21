@@ -1,0 +1,50 @@
+# systemd unit for the Fleet Management backend.
+#
+# Install on the Droplet with:
+#   sudo cp deploy/fleet-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fleet-api
+#
+# Useful commands:
+#   sudo systemctl status fleet-api      # is it running?
+#   sudo systemctl restart fleet-api     # after pulling new code
+#   sudo journalctl -u fleet-api -f      # live logs (Ctrl+C to exit)
+
+[Unit]
+Description=Fleet Management API (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=fleet
+Group=fleet
+WorkingDirectory=/opt/fleet/app
+
+# Binds to 127.0.0.1, NOT 0.0.0.0 -- only nginx should reach it directly.
+# Exposing 8000 publicly would bypass nginx's HTTPS and rate limiting.
+ExecStart=/opt/fleet/venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 2 \
+    --proxy-headers \
+    --forwarded-allow-ips='127.0.0.1'
+
+Restart=always
+RestartSec=5
+
+# Reads app/.env for DB credentials and JWT secret.
+EnvironmentFile=/opt/fleet/app/app/.env
+
+# --- Hardening -------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+# The app writes uploaded company logos here, so it must stay writable.
+ReadWritePaths=/opt/fleet/app/app/uploads
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

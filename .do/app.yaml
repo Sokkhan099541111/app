@@ -1,0 +1,89 @@
+# =====================================================================
+#  NOT IN USE -- kept for reference only.
+#
+#  This is a DigitalOcean APP PLATFORM spec. We are deploying to a
+#  DROPLET instead; see DROPLET_DEPLOY.md.
+#
+#  Why: the database is hosted on cPanel, and cPanel's Remote MySQL
+#  grants access by whitelisting specific IP addresses. App Platform
+#  does not give an app a fixed outbound IP, so a whitelist entry would
+#  eventually stop matching and the app would lose its database
+#  connection with no obvious cause. A Droplet has one permanent IP,
+#  which you whitelist once.
+#
+#  This file becomes relevant again only if the database moves to
+#  DigitalOcean Managed MySQL, at which point App Platform is the
+#  simpler option and this spec can be used as-is (after replacing the
+#  CHANGE_ME values with real secrets in the dashboard).
+# =====================================================================
+
+name: fleet-management
+region: sgp
+
+services:
+  - name: api
+    github:
+      repo: Sokkhan099541111/app
+      branch: main
+      deploy_on_push: true
+
+    source_dir: /
+    environment_slug: python
+    run_command: python run.py
+    http_port: 8080
+
+    instance_count: 1
+    instance_size_slug: basic-xxs
+
+    routes:
+      - path: /api
+      - path: /uploads
+
+    health_check:
+      http_path: /
+
+    envs:
+      # Set real values as SECRET in the dashboard, never in this file.
+      - key: DB_HOST
+        scope: RUN_TIME
+        value: "CHANGE_ME"
+      - key: DB_PORT
+        scope: RUN_TIME
+        value: "3306"
+      - key: DB_USER
+        scope: RUN_TIME
+        value: "CHANGE_ME"
+      - key: DB_PASSWORD
+        scope: RUN_TIME
+        type: SECRET
+        value: "CHANGE_ME"
+      - key: DB_NAME
+        scope: RUN_TIME
+        value: "CHANGE_ME"
+      - key: JWT_SECRET_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "CHANGE_ME"
+      - key: JWT_EXPIRE_MINUTES
+        scope: RUN_TIME
+        value: "480"
+      - key: DEFAULT_COMPANY_ID
+        scope: RUN_TIME
+        value: "1"
+
+static_sites:
+  - name: frontend
+    github:
+      repo: Sokkhan099541111/app
+      branch: main
+      deploy_on_push: true
+
+    source_dir: /frontend
+    environment_slug: node-js
+    build_command: npm ci && npm run build
+    output_dir: dist
+
+    routes:
+      - path: /
+
+    catchall_document: index.html

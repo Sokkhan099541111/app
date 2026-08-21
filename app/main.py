@@ -35,9 +35,28 @@ from app.services.auth_service import get_current_user, require_action_permissio
 
 app = FastAPI()
 
+# Which browser origins may call this API.
+#
+# Local development is always allowed. For a deployed frontend, set
+# CORS_ORIGINS in the environment to a comma-separated list of full
+# origins, e.g.
+#     CORS_ORIGINS=https://fleet.example.com,https://www.example.com
+#
+# Note: if the frontend and API are served from the SAME domain (for
+# example DigitalOcean routing /api to this service), the browser makes
+# same-origin requests and CORS never comes into play -- this setting is
+# only needed when they live on different domains.
+_default_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+_env_origins = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=_default_origins + _env_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
