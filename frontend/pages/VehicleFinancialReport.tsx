@@ -12,7 +12,7 @@ import {
 } from "@ant-design/icons";
 import { useAuth } from "../src/context/AuthContext";
 import dayjs, { Dayjs } from "dayjs";
-import ExcelJS from "exceljs";
+import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { useSearchParams } from "react-router-dom";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 
@@ -230,6 +230,7 @@ export default function VehicleFinancialReport() {
     }
     setExportLoading(true);
     try {
+      const ExcelJS = await loadExcelJS();
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet("Financial & KPI Report");
 

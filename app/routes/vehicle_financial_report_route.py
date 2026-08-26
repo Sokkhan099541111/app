@@ -224,7 +224,7 @@ def _staff_salary_by_vehicle(db: Session, year: int, month: int) -> dict:
                     e.basic_salary
                 ) AS total_basic_salary,
                 COALESCE(
-                    (SELECT SUM(a.is_attended) FROM attendance a
+                    (SELECT SUM(CASE WHEN a.status IN ('1','H') THEN 1 ELSE 0 END) FROM attendance a
                      WHERE a.employee_id = e.employee_id AND a.payroll_period_id = :payroll_period_id),
                     0
                 ) AS total_attended,

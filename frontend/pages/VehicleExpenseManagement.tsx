@@ -29,7 +29,7 @@ import {
   CloseOutlined,
 } from "@ant-design/icons";
 import dayjs from "dayjs";
-import ExcelJS from "exceljs";
+import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { useSearchParams } from "react-router-dom";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 import { useAuth } from "../src/context/AuthContext";
@@ -347,6 +347,7 @@ export default function VehicleExpenseManagement() {
         String(a.expense_date ?? "").localeCompare(String(b.expense_date ?? ""))
       );
 
+      const ExcelJS = await loadExcelJS();
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet("Vehicle Expenses");
 

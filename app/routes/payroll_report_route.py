@@ -153,9 +153,20 @@ def _fetch_payslip_rows(
                      ORDER BY fp.effective_date DESC LIMIT 1),
                     0
                 ) AS basic_of_food,
+                -- Counts the status directly rather than SUM(is_attended).
+                -- is_attended is a MySQL GENERATED column; if the table was
+                -- ever created or restored without that expression (a
+                -- restore from a dump, or a hand-made table), the column
+                -- silently stays 0 and every payroll figure that depends on
+                -- attended days reads as zero with no error anywhere.
+                -- Counting status IN ('1','H') gives the same answer and
+                -- cannot fail that way. '1' = Present, 'H' = Holiday; '0'
+                -- (Absent) and 'L' (Leave) are correctly not paid.
                 COALESCE(
-                    (SELECT SUM(a.is_attended) FROM attendance a
-                     WHERE a.employee_id = e.employee_id AND a.payroll_period_id = pp.payroll_period_id),
+                    (SELECT COUNT(*) FROM attendance a
+                     WHERE a.employee_id = e.employee_id
+                       AND a.payroll_period_id = pp.payroll_period_id
+                       AND a.status IN ('1', 'H')),
                     0
                 ) AS total_attended,
                 COALESCE(pe.ot_hours, 0) AS ot_hours,
@@ -489,9 +500,15 @@ def get_payroll_worksheet(
                          ORDER BY sh.effective_date DESC LIMIT 1),
                         e.basic_salary
                     ) AS total_basic_salary,
+                    -- See the note in _payroll_report_query: counts status
+                    -- directly instead of relying on the generated
+                    -- is_attended column, which reads 0 if the table was
+                    -- restored without the generation expression.
                     COALESCE(
-                        (SELECT SUM(a.is_attended) FROM attendance a
-                         WHERE a.employee_id = e.employee_id AND a.payroll_period_id = :payroll_period_id),
+                        (SELECT COUNT(*) FROM attendance a
+                         WHERE a.employee_id = e.employee_id
+                           AND a.payroll_period_id = :payroll_period_id
+                           AND a.status IN ('1', 'H')),
                         0
                     ) AS total_attended,
                     COALESCE(pe.ot_hours, 0) AS ot_hours,

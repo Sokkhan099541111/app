@@ -289,7 +289,7 @@ def _workforce_summary(db: Session, months: list, department_id: Optional[int]) 
         att_row = db.execute(
             text(
                 f"""
-                SELECT SUM(a.is_attended) AS attended
+                SELECT SUM(CASE WHEN a.status IN ('1','H') THEN 1 ELSE 0 END) AS attended
                 FROM attendance a
                 JOIN employees e ON e.employee_id = a.employee_id
                 WHERE a.payroll_period_id = :pid AND e.employment_status = 'Active' {dept_clause}
@@ -330,7 +330,7 @@ def _daily_summary(db: Session, today: date) -> dict:
     att_row = db.execute(
         text(
             """
-            SELECT SUM(a.is_attended) AS attended
+            SELECT SUM(CASE WHEN a.status IN ('1','H') THEN 1 ELSE 0 END) AS attended
             FROM attendance a
             JOIN employees e ON e.employee_id = a.employee_id
             WHERE a.work_date = :today AND e.employment_status = 'Active'

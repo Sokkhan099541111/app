@@ -25,7 +25,7 @@ import {
   CloseOutlined,
 } from "@ant-design/icons";
 import dayjs from "dayjs";
-import ExcelJS from "exceljs";
+import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 import { useAuth } from "../src/context/AuthContext";
 
@@ -198,6 +198,7 @@ export default function VendorManagement() {
       const exportColumns = columns.filter((col) => col.key !== "action");
       const totalColumns = Math.max(exportColumns.length, 4);
 
+      const ExcelJS = await loadExcelJS();
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet("Vendors");
 

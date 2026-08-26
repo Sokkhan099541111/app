@@ -4,7 +4,7 @@ import { FileExcelOutlined, ReloadOutlined, TableOutlined, CaretUpOutlined, Care
 import { useAuth } from "../src/context/AuthContext";
 import { Link } from "react-router-dom";
 import dayjs from "dayjs";
-import ExcelJS from "exceljs";
+import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 
 interface PeriodOption {
@@ -239,6 +239,7 @@ export default function PayrollWorksheet() {
     }
     setExportLoading(true);
     try {
+      const ExcelJS = await loadExcelJS();
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet("Payroll Worker");
 

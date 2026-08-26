@@ -29,7 +29,7 @@ import {
   CloseOutlined,
 } from "@ant-design/icons";
 import dayjs, { Dayjs } from "dayjs";
-import ExcelJS from "exceljs";
+import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { useSearchParams } from "react-router-dom";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 import { useAuth } from "../src/context/AuthContext";
@@ -361,6 +361,7 @@ export default function DailyKpiManagement() {
       const exportColumns = columns.filter((col) => col.key !== "action");
       const totalColumns = Math.max(exportColumns.length, 4);
 
+      const ExcelJS = await loadExcelJS();
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet("Daily KPI");
 

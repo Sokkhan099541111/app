@@ -3,7 +3,7 @@ import { Card, Table, Button, Space, Select, notification, Tooltip, message } fr
 import { CloseCircleFilled, FileTextOutlined, FileExcelOutlined } from "@ant-design/icons";
 import { useAuth } from "../src/context/AuthContext";
 import dayjs from "dayjs";
-import ExcelJS from "exceljs";
+import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { useSearchParams } from "react-router-dom";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 
@@ -434,6 +434,7 @@ export default function AttendanceReport() {
     try {
       const totalColumns = Math.max(header.length, 4);
 
+      const ExcelJS = await loadExcelJS();
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet("Attendance");
 

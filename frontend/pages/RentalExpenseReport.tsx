@@ -3,7 +3,7 @@ import { Card, Button, Tooltip, message, Empty, DatePicker, Spin } from "antd";
 import { FileExcelOutlined, ReloadOutlined, FileTextOutlined, CaretUpOutlined, CaretDownOutlined } from "@ant-design/icons";
 import { useAuth } from "../src/context/AuthContext";
 import dayjs, { Dayjs } from "dayjs";
-import ExcelJS from "exceljs";
+import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 
 const money = (v: number) =>
@@ -163,6 +163,7 @@ export default function RentalExpenseReport() {
     }
     setExportLoading(true);
     try {
+      const ExcelJS = await loadExcelJS();
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet("Rental Expense");
 
