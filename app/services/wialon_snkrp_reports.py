@@ -74,6 +74,11 @@ def get_operation_logs_by_vehicle_ids(
       - fuel_filling_liters: summed across the range
       - remarks: all distinct remarks in the range joined with "; "
         (GROUP_CONCAT ignores NULLs/blank rows automatically)
+      - project_code: all distinct project codes in the range joined with
+        "; ". Normally the report is run for a single day, so this is just
+        that day's code; over a wider range it lists every code the vehicle
+        worked under rather than arbitrarily picking one. Empty string when
+        no log in the range carries a code.
 
     Returns {vehicle_id: {...}}. start_date/end_date are "YYYY-MM-DD"
     strings (matched against the DATE column `operation_date`).
@@ -86,22 +91,40 @@ def get_operation_logs_by_vehicle_ids(
     params["start_date"] = start_date
     params["end_date"] = end_date
 
-    query = text(
-        f"""
-        SELECT vehicle_id,
-               MIN(start_time) AS start_time,
-               MAX(end_time) AS end_time,
-               MIN(initial_mileage) AS initial_mileage,
-               MAX(final_mileage) AS final_mileage,
-               SUM(fuel_filling_liters) AS fuel_filling_liters,
-               GROUP_CONCAT(DISTINCT remarks SEPARATOR '; ') AS remarks
-        FROM vehicle_operation_logs
-        WHERE vehicle_id IN ({placeholders})
-          AND operation_date BETWEEN :start_date AND :end_date
-        GROUP BY vehicle_id
-        """
-    )
-    result = db.execute(query, params)
+    def _build_query(with_project_code: bool):
+        project_code_select = (
+            "GROUP_CONCAT(DISTINCT NULLIF(TRIM(project_code), '') SEPARATOR '; ') AS project_code"
+            if with_project_code
+            else "NULL AS project_code"
+        )
+        return text(
+            f"""
+            SELECT vehicle_id,
+                   MIN(start_time) AS start_time,
+                   MAX(end_time) AS end_time,
+                   MIN(initial_mileage) AS initial_mileage,
+                   MAX(final_mileage) AS final_mileage,
+                   SUM(fuel_filling_liters) AS fuel_filling_liters,
+                   GROUP_CONCAT(DISTINCT remarks SEPARATOR '; ') AS remarks,
+                   {project_code_select}
+            FROM vehicle_operation_logs
+            WHERE vehicle_id IN ({placeholders})
+              AND operation_date BETWEEN :start_date AND :end_date
+            GROUP BY vehicle_id
+            """
+        )
+
+    try:
+        result = db.execute(_build_query(with_project_code=True), params)
+    except SQLAlchemyError as e:
+        # project_code is a late addition. If the migration
+        # (app/vehicle_operation_logs_add_project_code.sql) has not been run
+        # yet the column does not exist -- fall back to the query without it
+        # rather than losing start/end time, mileage and fuel as collateral.
+        print(f"DEBUG: project_code column missing, querying without it: {e}")
+        db.rollback()
+        result = db.execute(_build_query(with_project_code=False), params)
+
     logs = {}
     for row in result:
         working_hours = 0.0
@@ -120,8 +143,75 @@ def get_operation_logs_by_vehicle_ids(
             "total_mileage": round(final_mileage - initial_mileage, 2),
             "fuel_filling_liters": float(row.fuel_filling_liters) if row.fuel_filling_liters is not None else 0.0,
             "remarks": row.remarks or "",
+            "project_code": row.project_code or "",
         }
     return logs
+
+
+def get_rental_attendance_by_vehicle_ids(
+    db: Session, vehicle_ids: list, start_date: str, end_date: str
+) -> dict:
+    """
+    The Rental Attendance Entry status per vehicle over a date range, for
+    the Daily Machinery Operation Report's Remark column.
+
+    Attendance is recorded per RENTAL record, not per vehicle
+    (vehicle_rental_attendance.rental_id -> vehicle_rentals.vehicles_id),
+    so the join has to hop through vehicle_rentals to get back to the
+    Wialon unit id that /reports/vehicles keys every row on ("key").
+
+    The report is normally run for a single day, in which case each vehicle
+    has at most one status and that status is returned verbatim ("Working",
+    "On Standby", "Broken"). If a wider range is requested and the statuses
+    differ across days, a count summary is returned instead
+    ("Working: 3, On Standby: 1") rather than silently picking one day and
+    presenting it as the answer for the whole range.
+
+    Vehicles with NO attendance rows are simply absent from the result --
+    the caller leaves the field blank and the frontend renders "No Action".
+
+    Returns {vehicle_id: "status text"}. Returns {} on any failure so a
+    missing vehicle_rentals table can never break the whole report.
+    """
+    if not vehicle_ids:
+        return {}
+
+    placeholders = ", ".join(f":id{i}" for i in range(len(vehicle_ids)))
+    params = {f"id{i}": vid for i, vid in enumerate(vehicle_ids)}
+    params["start_date"] = start_date
+    params["end_date"] = end_date
+
+    query = text(
+        f"""
+        SELECT r.vehicles_id, a.status, COUNT(*) AS day_count
+        FROM vehicle_rental_attendance a
+        JOIN vehicle_rentals r ON r.rental_id = a.rental_id
+        WHERE r.vehicles_id IN ({placeholders})
+          AND a.work_date BETWEEN :start_date AND :end_date
+        GROUP BY r.vehicles_id, a.status
+        """
+    )
+
+    try:
+        result = db.execute(query, params)
+    except SQLAlchemyError as e:
+        print(f"DEBUG: rental attendance join failed: {e}")
+        return {}
+
+    by_vehicle: dict = {}
+    for row in result:
+        by_vehicle.setdefault(row.vehicles_id, []).append((row.status, int(row.day_count)))
+
+    attendance = {}
+    for vehicle_id, pairs in by_vehicle.items():
+        if len(pairs) == 1:
+            # One status across the whole range -- show it as-is.
+            attendance[vehicle_id] = pairs[0][0]
+        else:
+            # Mixed statuses over a multi-day range -- show the breakdown.
+            pairs.sort(key=lambda p: (-p[1], p[0]))
+            attendance[vehicle_id] = ", ".join(f"{status}: {count}" for status, count in pairs)
+    return attendance
 
 
 def get_wialon_credentials(db: Session, company_id: int) -> dict:
@@ -308,16 +398,24 @@ class WialonReportService:
         """
         candidates_lower = {c.lower() for c in candidate_names}
 
-        pflds = unit.get("pflds") or {}
-        if isinstance(pflds, dict):
-            for field in pflds.values():
-                if isinstance(field, dict) and str(field.get("n", "")).lower() in candidates_lower:
-                    return field.get("v", "")
+        def _iter_fields(container):
+            """Wialon returns these collections as EITHER a dict keyed by
+            field id OR a list, depending on the endpoint and API version.
+            Handling only one shape (as this used to) silently returns ""
+            whenever the account happens to send the other."""
+            if isinstance(container, dict):
+                return container.values()
+            if isinstance(container, list):
+                return container
+            return []
 
-        flds = unit.get("flds") or []
-        if isinstance(flds, list):
-            for field in flds:
-                if str(field.get("n", "")).lower() in candidates_lower:
+        # Profile fields first, then custom fields -- a name defined in both
+        # places resolves to the profile value, which is the more specific.
+        for container in (unit.get("pflds"), unit.get("flds")):
+            for field in _iter_fields(container):
+                if not isinstance(field, dict):
+                    continue
+                if str(field.get("n", "")).strip().lower() in candidates_lower:
                     return field.get("v", "")
 
         return ""

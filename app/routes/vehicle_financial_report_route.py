@@ -14,8 +14,11 @@ Per-vehicle figures and where each comes from:
     (same convention as Vehicle Rental / Daily KPI / Vehicle Expense).
   - Total Monthly Revenue -- SUM of Daily KPI Entry's computed KPI
     (LEAST(quantity, daily_productivity) * unit_price) for the month.
-  - Repair & Maintenance / Engine Oil, Pump & Brake / Diesel Fuel Expenses
-    -- SUM(vehicle_expenses.amount) per category for the month.
+  - Repair & Maintenance / Engine Oil, Pump & Brake / Diesel Fuel / Other
+    Expense -- SUM(vehicle_expenses.amount) per category for the month.
+    Other Expense is the catch-all category added in
+    app/vehicle_expenses_add_other_category.sql; it is summed and totalled
+    exactly like the other three.
   - Total Staff Salary -- SUM of Payroll Worker by Month's "Total Salary
     Daily" for whichever employee(s) have this vehicle assigned
     (employees.vehicles_id), for the payroll_periods row matching the
@@ -31,9 +34,12 @@ Per-vehicle figures and where each comes from:
 
 Computed (never stored):
     Total Monthly Expenses  = Repair + Engine Oil/Pump/Brake + Diesel
-                               + Staff Salary + Vehicle Rental Expense
+                               + Other Expense + Staff Salary
+                               + Vehicle Rental Expense
     Monthly Profit           = Total Monthly Revenue - Total Monthly Expenses
     Monthly Profit + Bonus   = Monthly Profit + Bonus
+                               (Bonus may be negative -- see the Bonus note
+                                below -- in which case this REDUCES the total)
     Monthly KPI               = 200                       if Monthly Profit > 200
                                  0                          if Monthly Profit < 0
                                  Monthly Profit             otherwise
@@ -47,7 +53,7 @@ import calendar
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -64,16 +70,29 @@ FLEET_TEMPLATE_ID = 21
 REPAIR_CATEGORY = "Repair Expenses / Maintenance Cost"
 ENGINE_OIL_CATEGORY = "Engine Oil, Pump & Brake"
 DIESEL_CATEGORY = "Diesel Fuel"
+OTHER_CATEGORY = "Other Expense"
 
 
 # --- Request body (manual extras) -----------------------------------------
 
 class VehicleMonthlyKpiIn(BaseModel):
+    """Bonus and Meter / Month for one vehicle in one month.
+
+    `bonus` is deliberately unbounded: it is a manual adjustment that can
+    be POSITIVE (a reward, increasing Monthly Profit + Bonus and therefore
+    KPI Achieved) or NEGATIVE (a penalty, reducing them). Do not add a
+    ge=0 constraint here -- and note that the database column must be a
+    signed DECIMAL for a negative value to survive the round trip; see
+    app/vehicle_monthly_kpi_allow_negative_bonus.sql.
+
+    `meter_per_month` is an odometer reading, so it is constrained to zero
+    or more.
+    """
     vehicles_id: int
     year: int
-    month: int
+    month: int = Field(..., ge=1, le=12)
     bonus: float = 0
-    meter_per_month: float = 0
+    meter_per_month: float = Field(0, ge=0)
 
 
 def _clamp_monthly_kpi(monthly_profit: float) -> float:
@@ -85,6 +104,14 @@ def _clamp_monthly_kpi(monthly_profit: float) -> float:
 
 
 def _clamp_kpi_achieved(monthly_profit_plus_bonus: float) -> float:
+    """KPI Achieved is capped at 200 and floored at 0.
+
+    The floor is what makes a negative Bonus behave the way the business
+    expects: a penalty large enough to drag Monthly Profit + Bonus to or
+    below zero yields KPI Achieved = 0, not a negative KPI. The negative
+    value is still visible in the Bonus and Monthly Profit + Bonus columns
+    -- only the KPI itself is floored.
+    """
     if monthly_profit_plus_bonus > 200:
         return 200.0
     if monthly_profit_plus_bonus <= 0:
@@ -228,6 +255,15 @@ def _staff_salary_by_vehicle(db: Session, year: int, month: int) -> dict:
                      WHERE a.employee_id = e.employee_id AND a.payroll_period_id = :payroll_period_id),
                     0
                 ) AS total_attended,
+                -- Present ONLY ('1'). Basic Food is paid on days actually
+                -- worked, so it must not count Holiday ('H') the way
+                -- total_attended above does. Kept identical to the payroll
+                -- worksheet so Total Staff Salary here matches it exactly.
+                COALESCE(
+                    (SELECT SUM(CASE WHEN a.status = '1' THEN 1 ELSE 0 END) FROM attendance a
+                     WHERE a.employee_id = e.employee_id AND a.payroll_period_id = :payroll_period_id),
+                    0
+                ) AS total_present,
                 COALESCE(pe.ot_amount, 0) AS ot_amount,
                 COALESCE(pe.other_allowance, 0) AS other_allowance,
                 COALESCE(
@@ -249,12 +285,13 @@ def _staff_salary_by_vehicle(db: Session, year: int, month: int) -> dict:
     for r in emp_rows:
         total_basic_salary = float(r.total_basic_salary)
         total_attended = int(r.total_attended)
+        total_present = int(r.total_present)
         basic_of_food = float(r.basic_of_food)
         ot_amount = float(r.ot_amount)
         other_allowance = float(r.other_allowance)
 
         total_amount = round((total_basic_salary / total_working_days) * total_attended, 2)
-        food_daily = round((basic_of_food / total_working_days) * total_attended, 2)
+        food_daily = round((basic_of_food / total_working_days) * total_present, 2)
         total_salary_daily = round(total_amount + ot_amount + food_daily + other_allowance, 2)
 
         result[r.vehicles_id] = result.get(r.vehicles_id, 0) + total_salary_daily
@@ -343,11 +380,14 @@ def get_vehicle_financial_report(
         repair = cats.get(REPAIR_CATEGORY, 0)
         engine_oil = cats.get(ENGINE_OIL_CATEGORY, 0)
         diesel = cats.get(DIESEL_CATEGORY, 0)
+        other = cats.get(OTHER_CATEGORY, 0)
         staff_salary = salary_by_vehicle.get(vid, 0)
         rental = rental_by_vehicle.get(vid, {"expense": 0.0, "working": 0, "standby": 0, "broken": 0})
         rental_expense = rental["expense"]
 
-        total_monthly_expenses = round(repair + engine_oil + diesel + staff_salary + rental_expense, 2)
+        total_monthly_expenses = round(
+            repair + engine_oil + diesel + other + staff_salary + rental_expense, 2
+        )
         monthly_profit = round(revenue - total_monthly_expenses, 2)
 
         extras = extras_by_vehicle.get(vid, {})
@@ -373,6 +413,7 @@ def get_vehicle_financial_report(
                 "repair_expense": round(repair, 2),
                 "engine_oil_expense": round(engine_oil, 2),
                 "diesel_expense": round(diesel, 2),
+                "other_expense": round(other, 2),
                 "staff_salary": round(staff_salary, 2),
                 "rental_expense": round(rental_expense, 2),
                 "total_monthly_expenses": total_monthly_expenses,

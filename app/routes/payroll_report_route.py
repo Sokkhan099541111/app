@@ -122,11 +122,16 @@ def _fetch_payslip_rows(
         SELECT
             base.*,
             ROUND(base.total_basic_salary / base.total_working_days, 2) AS salary_per_day,
+            -- Salary is paid on ATTENDED days (Present + Holiday).
             ROUND((base.total_basic_salary / base.total_working_days) * base.total_attended, 2) AS total_amount,
-            ROUND((base.basic_of_food / base.total_working_days) * base.total_attended, 2) AS food_daily,
+            -- Basic Food is paid ONLY on days actually marked Present.
+            -- A holiday is paid but nobody is on site to be fed, so it must
+            -- not attract a food allowance -- hence total_present, not
+            -- total_attended.
+            ROUND((base.basic_of_food / base.total_working_days) * base.total_present, 2) AS food_daily,
             ROUND((base.total_basic_salary / base.total_working_days) * base.total_attended, 2)
                 + base.ot_amount
-                + ROUND((base.basic_of_food / base.total_working_days) * base.total_attended, 2)
+                + ROUND((base.basic_of_food / base.total_working_days) * base.total_present, 2)
                 + base.other_allowance AS total_salary_daily
         FROM (
             SELECT
@@ -169,6 +174,15 @@ def _fetch_payslip_rows(
                        AND a.status IN ('1', 'H')),
                     0
                 ) AS total_attended,
+                -- Present ONLY ('1'). Drives Basic Food, which is not paid
+                -- for Holiday ('H'), Absent ('0') or Leave ('L').
+                COALESCE(
+                    (SELECT COUNT(*) FROM attendance a
+                     WHERE a.employee_id = e.employee_id
+                       AND a.payroll_period_id = pp.payroll_period_id
+                       AND a.status = '1'),
+                    0
+                ) AS total_present,
                 COALESCE(pe.ot_hours, 0) AS ot_hours,
                 COALESCE(pe.ot_amount, 0) AS ot_amount,
                 COALESCE(pe.other_allowance, 0) AS other_allowance
@@ -313,12 +327,17 @@ def _build_payslip_pdf(rows: list[dict], logo_path: Optional[str] = None) -> byt
         story.append(Spacer(1, 4))
         working_days = row.get("total_working_days") or 0
         attended = row.get("total_attended") or 0
+        # Basic Food is pro-rated on PRESENT days only, so the payslip must
+        # not claim it was pro-rated over attended days (which include
+        # holidays) -- the arithmetic would not reconcile for a staff
+        # member whose month contained one.
+        present = row.get("total_present") or 0
         salary_per_day = row.get("salary_per_day") or 0
         earn_rows = [
             ["Basic Salary (Monthly)", f"{money(row.get('total_basic_salary'))} / {working_days} days", f"{money(salary_per_day)} /day"],
             ["Basic Pay", f"{money(salary_per_day)} x {attended} days attended", money(row.get("total_amount"))],
             ["Overtime", f"{float(row.get('ot_hours') or 0):.1f} hrs", money(row.get("ot_amount"))],
-            ["Food Allowance", f"pro-rated x {attended} days", money(row.get("food_daily"))],
+            ["Food Allowance", f"pro-rated x {present} days present", money(row.get("food_daily"))],
             ["Other Allowance", "-", money(row.get("other_allowance"))],
         ]
         table_data = [["Description", "Detail", "Amount"]] + earn_rows
@@ -511,6 +530,15 @@ def get_payroll_worksheet(
                            AND a.status IN ('1', 'H')),
                         0
                     ) AS total_attended,
+                    -- Present ONLY ('1') -- Basic Food is paid on days the
+                    -- staff member was actually present, not on holidays.
+                    COALESCE(
+                        (SELECT COUNT(*) FROM attendance a
+                         WHERE a.employee_id = e.employee_id
+                           AND a.payroll_period_id = :payroll_period_id
+                           AND a.status = '1'),
+                        0
+                    ) AS total_present,
                     COALESCE(pe.ot_hours, 0) AS ot_hours,
                     COALESCE(pe.ot_amount, 0) AS ot_amount,
                     COALESCE(pe.other_allowance, 0) AS other_allowance,
@@ -537,13 +565,15 @@ def get_payroll_worksheet(
             row = _row_to_dict(r)
             total_basic_salary = float(row["total_basic_salary"])
             total_attended = int(row["total_attended"])
+            total_present = int(row["total_present"])
             basic_of_food = float(row["basic_of_food"])
             ot_amount = float(row["ot_amount"])
             other_allowance = float(row["other_allowance"])
 
             salary_per_day = round(total_basic_salary / total_working_days, 2)
             total_amount = round((total_basic_salary / total_working_days) * total_attended, 2)
-            food_daily = round((basic_of_food / total_working_days) * total_attended, 2)
+            # Basic Food: Present days only (see the SQL comment above).
+            food_daily = round((basic_of_food / total_working_days) * total_present, 2)
             total_salary_daily = round(total_amount + ot_amount + food_daily + other_allowance, 2)
 
             employees.append(
@@ -553,6 +583,7 @@ def get_payroll_worksheet(
                     "salary_per_day": salary_per_day,
                     "total_working_days": total_working_days,
                     "total_attended": total_attended,
+                    "total_present": total_present,
                     "total_amount": total_amount,
                     "ot_hours": float(row["ot_hours"]),
                     "ot_amount": ot_amount,

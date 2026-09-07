@@ -58,6 +58,9 @@ from sqlalchemy.orm import Session
 from app.config.database import get_db
 from app.config.settings import DEFAULT_COMPANY_ID
 from app.services.wialon_snkrp_reports import WialonReportService, get_wialon_credentials
+# One shared list of the field names a vehicle Code may use in Wialon, so
+# every module resolves the code the same way.
+from app.routes.vehicle_operation_logs_route import VEHICLE_CODE_FIELD_NAMES
 
 router = APIRouter()
 
@@ -201,13 +204,60 @@ def _enrich_with_vehicle_info(db: Session, company_id: int) -> dict:
         )
         metrics_by_name = service.parse_report_metrics_by_name(report_rows)
 
+        # The fleet report is matched to units BY NAME, which is where a
+        # vehicle can pick up another vehicle's code. Two guards:
+        #
+        #  1. Names are compared case-insensitively, so "CR09 3E-7476" and
+        #     "cr09 3e-7476" are the same vehicle rather than a miss.
+        #  2. If a normalized name is not UNIQUE -- duplicate unit names in
+        #     Wialon, or two report rows collapsing to the same key -- the
+        #     name cannot identify one vehicle, so no code is used at all.
+        #     A blank ("No Vehicle Code" on screen) is honest; silently
+        #     handing a vehicle its namesake's code is not.
+        def _key(name) -> str:
+            return service.normalize_name(name).casefold()
+
+        report_by_key: dict = {}
+        ambiguous_keys = set()
+        for name, metrics in metrics_by_name.items():
+            k = _key(name)
+            if k in report_by_key:
+                ambiguous_keys.add(k)
+            report_by_key[k] = metrics
+
+        unit_name_counts: dict = {}
+        for row in rows:
+            k = _key(row.get("vehicle"))
+            unit_name_counts[k] = unit_name_counts.get(k, 0) + 1
+        ambiguous_keys |= {k for k, n in unit_name_counts.items() if n > 1}
+
+        if ambiguous_keys:
+            print(
+                f"DEBUG: {len(ambiguous_keys)} vehicle name(s) are not unique "
+                f"({sorted(ambiguous_keys)[:5]}...) -- code left blank for these "
+                "rather than risking another vehicle's code"
+            )
+
+        # Per-unit custom field is preferred over the report entirely: it is
+        # read from the unit itself, so it CANNOT be another vehicle's code
+        # regardless of naming. See GET /api/debug/fleet-report-columns.
+        units_by_id = {u.get("id"): u for u in units}
+
         result = {}
         for row in rows:
-            key = service.normalize_name(row.get("vehicle"))
-            metrics = metrics_by_name.get(key, {})
-            result[row["key"]] = {
+            vehicle_id = row["key"]
+            k = _key(row.get("vehicle"))
+
+            from_field = ""
+            unit = units_by_id.get(vehicle_id)
+            if unit is not None:
+                from_field = service.get_custom_field(unit, *VEHICLE_CODE_FIELD_NAMES)
+
+            metrics = {} if k in ambiguous_keys else report_by_key.get(k, {})
+
+            result[vehicle_id] = {
                 "plate_number": row.get("plate") or "",
-                "code": metrics.get("code", ""),
+                "code": (from_field or metrics.get("code", "") or "").strip(),
                 "vehicle_type": metrics.get("vehicleTypeEng", ""),
             }
         return result

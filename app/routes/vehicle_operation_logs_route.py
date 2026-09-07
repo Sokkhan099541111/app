@@ -13,9 +13,11 @@ app/vehicle_operation_logs_add_status.sql instead):
     log_id              INT UNSIGNED AUTO_INCREMENT PK
     vehicle_id          INT UNSIGNED      -- Wialon avl_unit id
     operation_date      DATE
+    project_code        VARCHAR(50) NULL  -- see app/vehicle_operation_logs_add_project_code.sql
     start_time          DATETIME
     end_time            DATETIME
-    working_hours       DECIMAL(5,2)   GENERATED (hours between start/end)
+    working_hours       DECIMAL(5,2)   -- manually entered by the user; see
+                                       -- app/vehicle_operation_logs_manual_working_hours.sql
     initial_mileage     DECIMAL(10,2)
     final_mileage       DECIMAL(10,2)
     total_mileage       VARCHAR(50)
@@ -26,9 +28,12 @@ app/vehicle_operation_logs_add_status.sql instead):
     created_at          TIMESTAMP
     updated_at          TIMESTAMP
 
-working_hours and distance_travelled are MySQL GENERATED columns -- never
-set them directly in INSERT/UPDATE, MySQL computes them from the other
-columns.
+distance_travelled is still a MySQL GENERATED column -- never set it
+directly in INSERT/UPDATE, MySQL computes it from initial/final mileage.
+
+working_hours USED to be generated too, but is now an ordinary column that
+the user types in (the entry form shows what the start/end times imply as
+a hint, but never overwrites what was entered).
 
 Business rules enforced here:
   - Duplicate check: only one Active log per (vehicle_id, operation_date)
@@ -43,7 +48,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -60,14 +65,33 @@ router = APIRouter()
 FLEET_RESOURCE_ID = 601651347
 FLEET_TEMPLATE_ID = 21
 
+# Names the vehicle Code might carry as a unit custom/profile field.
+# Wialon field names are account-specific -- run
+# GET /api/debug/fleet-report-columns to see the real names on your units
+# and add whichever one holds the code (e.g. "VID-385") to this list.
+VEHICLE_CODE_FIELD_NAMES = (
+    "code",
+    "vehicle code",
+    "vehicle_code",
+    "vehiclecode",
+    "unit code",
+    "fleet code",
+    "vid",
+)
+
 
 # --- Request bodies ----------------------------------------------------
 
 class VehicleOperationLogIn(BaseModel):
     vehicle_id: int
     operation_date: date
+    project_code: Optional[str] = Field(None, max_length=50)
     start_time: datetime
     end_time: datetime
+    # Manually entered, NOT derived from start/end. Capped at 24 -- a
+    # single day's operation log cannot exceed one day of hours, and the
+    # DECIMAL(5,2) column would silently accept nonsense like 999.99.
+    working_hours: Optional[float] = Field(None, ge=0, le=24)
     initial_mileage: float = 0
     final_mileage: float = 0
     total_mileage: Optional[str] = None
@@ -79,8 +103,10 @@ class VehicleOperationLogUpdate(BaseModel):
     """All fields optional -- only columns actually sent get updated."""
     vehicle_id: Optional[int] = None
     operation_date: Optional[date] = None
+    project_code: Optional[str] = Field(None, max_length=50)
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
+    working_hours: Optional[float] = Field(None, ge=0, le=24)
     initial_mileage: Optional[float] = None
     final_mileage: Optional[float] = None
     total_mileage: Optional[str] = None
@@ -195,18 +221,147 @@ def list_vehicle_logs(
         )
 
 
+@router.get("/vehicle-logs/project-codes")
+def get_project_codes(db: Session = Depends(get_db)):
+    """Every distinct Project Code already used on an operation log.
+
+    Backs the "or select" half of the entry form's Project Code field: the
+    user can type a brand-new code, or pick one they have used before,
+    which keeps codes consistent without hard-coding a master list this
+    system does not own.
+
+    Returns an empty list (not an error) if the column does not exist yet
+    -- the form then behaves as a plain free-text field, so the page still
+    works before app/vehicle_operation_logs_add_project_code.sql is run.
+    """
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT DISTINCT project_code
+                FROM vehicle_operation_logs
+                WHERE project_code IS NOT NULL AND TRIM(project_code) <> ''
+                ORDER BY project_code
+                """
+            )
+        )
+        return {"status": "success", "project_codes": [r.project_code for r in rows]}
+    except SQLAlchemyError as e:
+        print(f"DEBUG: project code lookup failed (has the migration been run?): {e}")
+        return {"status": "success", "project_codes": []}
+
+
 @router.get("/vehicle-logs/vehicle-options")
 def get_vehicle_options(
     company_id: int = Query(DEFAULT_COMPANY_ID, description="Company whose Wialon credentials to use"),
     db: Session = Depends(get_db),
 ):
-    """{id, name} for every vehicle in the company's Wialon account --
-    used to populate the vehicle_id dropdown on the log form."""
+    """{id, name, code} for every vehicle in the company's Wialon account,
+    used to populate the vehicle pickers across the app.
+
+    `name` is the Wialon unit name (the plate number) and `code` is the
+    fleet code (e.g. VID-385), which lives only in the fleet report -- the
+    unit list itself does not carry it. The code is overlaid by matching
+    normalized unit names, the same approach /vehicle-logs/vehicle-types
+    uses.
+
+    The code overlay is best-effort: if the fleet report is unavailable,
+    every vehicle simply comes back with code "" and the pickers fall back
+    to showing the plate number alone, rather than the whole dropdown
+    failing.
+
+    The report is run against EVERY unit group and the results merged. It
+    used to run against groups[0] only, while the unit list above is
+    account-wide -- so every vehicle outside that one group came back with
+    code "" and rendered as a bare plate number instead of
+    "VID-385 - TT10 3A-3893". Each group is guarded separately so one
+    failing group still leaves the others' codes intact."""
     creds = get_wialon_credentials(db, company_id)
     try:
         service = WialonReportService(base_url=creds["base_url"])
         service.login(creds["wialon_token"])
-        return {"status": "success", "vehicles": service.get_all_units()}
+        all_units = service.get_all_units()
+
+        metrics_by_name: dict = {}
+        try:
+            groups = service.get_objects()
+            now = int(time.time())
+            for group in groups or []:
+                group_id = group.get("id")
+                if not group_id:
+                    continue
+                try:
+                    report_rows = service.run_report(
+                        resource_id=FLEET_RESOURCE_ID,
+                        template_id=FLEET_TEMPLATE_ID,
+                        object_id=group_id,
+                        start=now - 86400,
+                        end=now,
+                    )
+                except Exception as group_err:  # noqa: BLE001
+                    print(f"DEBUG: fleet report failed for group {group_id}: {group_err}")
+                    continue
+
+                for key, metrics in service.parse_report_metrics_by_name(report_rows).items():
+                    # First group to supply a non-empty code wins; a later
+                    # group must not overwrite a good code with a blank one
+                    # for a vehicle that appears in more than one group.
+                    if metrics.get("code") and not metrics_by_name.get(key, {}).get("code"):
+                        metrics_by_name[key] = metrics
+                    elif key not in metrics_by_name:
+                        metrics_by_name[key] = metrics
+        except Exception as e:  # noqa: BLE001
+            print(f"DEBUG: vehicle-options code overlay failed, continuing without codes: {e}")
+
+        missing = sum(
+            1
+            for u in all_units
+            if not metrics_by_name.get(service.normalize_name(u.get("name")), {}).get("code")
+        )
+        if missing:
+            # Surfaced in the log because the symptom on screen -- a plate
+            # number with no code -- is otherwise indistinguishable from a
+            # frontend problem.
+            print(
+                f"DEBUG: {missing}/{len(all_units)} vehicles have no fleet code "
+                "(not present in any unit group's fleet report)"
+            )
+
+        # Prefer the unit's OWN custom/profile field for the code, falling
+        # back to the fleet report column.
+        #
+        # The report is parsed by column POSITION, so any edit to the
+        # template in Wialon's Report Designer shifts the columns and the
+        # "code" silently becomes whatever now sits at index 1 -- which is
+        # how Vehicle Group values ("Assigned" / "Not Assigned") ended up
+        # rendering as vehicle codes. A custom field is addressed by NAME
+        # and cannot be knocked out of alignment that way.
+        #
+        # See GET /api/debug/fleet-report-columns to inspect both sources
+        # and confirm which field names this account actually uses.
+        units_by_id = {}
+        try:
+            summaries = service.get_units_summary([u["id"] for u in all_units])
+            units_by_id = {s.get("id"): s for s in summaries}
+        except Exception as e:  # noqa: BLE001
+            print(f"DEBUG: could not load unit custom fields for codes: {e}")
+
+        vehicles = []
+        for u in all_units:
+            from_report = metrics_by_name.get(
+                service.normalize_name(u.get("name")), {}
+            ).get("code", "")
+
+            from_field = ""
+            summary = units_by_id.get(u["id"])
+            if summary is not None:
+                from_field = service.get_custom_field(
+                    summary, *VEHICLE_CODE_FIELD_NAMES
+                )
+
+            vehicles.append({**u, "code": (from_field or from_report or "").strip()})
+
+        return {"status": "success", "vehicles": vehicles}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -282,9 +437,10 @@ def get_vehicle_log(log_id: int, db: Session = Depends(get_db)):
 def create_vehicle_log(payload: VehicleOperationLogIn, db: Session = Depends(get_db)):
     """
     Insert a new log row (status defaults to 'Active' at the DB level).
-    working_hours/distance_travelled are intentionally left out of the
-    INSERT -- they're MySQL GENERATED columns computed from
-    start_time/end_time and initial_mileage/final_mileage.
+    distance_travelled is intentionally left out of the INSERT -- it is a
+    MySQL GENERATED column computed from initial_mileage/final_mileage.
+    working_hours IS written, because it is now entered by the user rather
+    than derived.
 
     Rejects with 409 if an Active log already exists for this vehicle on
     this operation_date.
@@ -304,12 +460,12 @@ def create_vehicle_log(payload: VehicleOperationLogIn, db: Session = Depends(get
             text(
                 """
                 INSERT INTO vehicle_operation_logs
-                    (vehicle_id, operation_date, start_time, end_time,
-                     initial_mileage, final_mileage, total_mileage,
+                    (vehicle_id, operation_date, project_code, start_time, end_time,
+                     working_hours, initial_mileage, final_mileage, total_mileage,
                      fuel_filling_liters, remarks)
                 VALUES
-                    (:vehicle_id, :operation_date, :start_time, :end_time,
-                     :initial_mileage, :final_mileage, :total_mileage,
+                    (:vehicle_id, :operation_date, :project_code, :start_time, :end_time,
+                     :working_hours, :initial_mileage, :final_mileage, :total_mileage,
                      :fuel_filling_liters, :remarks)
                 """
             ),

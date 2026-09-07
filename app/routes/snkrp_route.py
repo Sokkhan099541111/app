@@ -8,6 +8,7 @@ from app.services.wialon_snkrp_reports import (
     WialonReportService,
     get_employees_by_vehicle_ids,
     get_operation_logs_by_vehicle_ids,
+    get_rental_attendance_by_vehicle_ids,
     get_wialon_credentials,
 )
 from app.config.database import get_db
@@ -147,6 +148,13 @@ def get_vehicle_list(
         # Overlay operation-log data (start/end time, working hours,
         # initial/final mileage, fuel filled) per vehicle for the selected
         # date range, joined on vehicle_operation_logs.vehicle_id == "key".
+        #
+        # Project Code is collected into its own dict here rather than
+        # written straight onto the row, and applied AFTER the fleet-report
+        # block below, so nothing downstream can overwrite it. The Vehicle
+        # Operation Log is the ONLY source for that column.
+        project_code_from_log: dict = {}
+
         if start and end:
             try:
                 logs_by_vehicle = get_operation_logs_by_vehicle_ids(
@@ -155,6 +163,8 @@ def get_vehicle_list(
                 for row in rows:
                     log = logs_by_vehicle.get(row["key"])
                     if log:
+                        if log.get("project_code"):
+                            project_code_from_log[row["key"]] = log["project_code"]
                         row["startTime"] = log["start_time"]
                         row["endTime"] = log["end_time"]
                         row["workingHours"] = log["working_hours"]
@@ -167,6 +177,23 @@ def get_vehicle_list(
                 # Don't fail the whole vehicle list if the operation logs
                 # join errors out -- just leave these fields blank/0.
                 print(f"DEBUG: operation logs join failed: {log_err}")
+
+        # Overlay the Rental Attendance Entry status per vehicle for the
+        # selected date range. This drives the Remark column of the Daily
+        # Machinery Operation Report, so it runs for EVERY vehicle in the
+        # list -- independently of whether that vehicle has an operation
+        # log -- and leaves the field empty when no attendance exists, which
+        # the frontend renders as "No Action".
+        if start and end:
+            try:
+                attendance_by_vehicle = get_rental_attendance_by_vehicle_ids(
+                    db, [row["key"] for row in rows], start, end
+                )
+                for row in rows:
+                    row["attendanceStatus"] = attendance_by_vehicle.get(row["key"], "")
+            except Exception as attendance_err:
+                # Same rule as the joins above -- never fail the whole list.
+                print(f"DEBUG: rental attendance join failed: {attendance_err}")
 
         # Overlay real mileage (km) for the selected date range from the
         # fleet report, matched back to each row by (normalized) vehicle name.
@@ -190,7 +217,12 @@ def get_vehicle_list(
                         row["vehicleTypeEng"] = metrics["vehicleTypeEng"]
                         row["vehicleTypeKh"] = metrics["vehicleTypeKh"]
                         row["baseLocation"] = metrics["baseLocation"]
-                        row["projectCode"] = metrics["projectCode"]
+                        # NOTE: projectCode is deliberately NOT taken from the
+                        # fleet report any more. Project Code is now entered by
+                        # users on the Vehicle Operation Log, and that record is
+                        # the single source of truth -- see the block after this
+                        # loop. Re-adding it here would silently overwrite the
+                        # value the user typed.
                         row["mileage"] = metrics["mileage"]
                         row["engineHours"] = metrics["engineHours"]
                         row["initialFuel"] = metrics["initialFuel"]
@@ -203,10 +235,112 @@ def get_vehicle_list(
                 # errors out -- just leave mileage at 0 for this search.
                 print(f"DEBUG: mileage report failed: {report_err}")
 
+        # Project Code comes from the Vehicle Operation Log for this vehicle
+        # and date range -- and from nowhere else. Assigning unconditionally
+        # (rather than only when a code was found) is the point: a vehicle
+        # with no operation log, or a log whose Project Code was left empty,
+        # must read blank rather than falling back to some other source and
+        # showing a value that does not exist on any log record.
+        for row in rows:
+            row["projectCode"] = project_code_from_log.get(row["key"], "")
+
         return rows
 
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/debug/fleet-report-columns")
+def debug_fleet_report_columns(
+    limit: int = Query(3, description="How many units/report rows to dump"),
+    company_id: int = Query(DEFAULT_COMPANY_ID, description="Company whose Wialon credentials to use"),
+    db: Session = Depends(get_db),
+):
+    """Dump the fleet report's RAW columns, with their index positions,
+    next to each unit's custom/profile field names and values.
+
+    Why this exists: parse_report_metrics_by_name() reads the report by
+    COLUMN POSITION (index 1 = code, 2 = vehicle type, and so on). Editing
+    the template in Wialon's Report Designer -- including adding a custom
+    field like "Vehicle Group" -- shifts every column after the insertion
+    point, and the parser then silently reports the wrong field. There is
+    no error; a code just quietly becomes something else.
+
+    Run this whenever a column looks wrong, compare the indices below with
+    the map in parse_report_metrics_by_name's docstring, and correct the
+    indices to match. The custom-field dump also shows exactly which field
+    names this account uses, for the *_FIELD_NAMES candidate lists.
+    """
+    creds = get_wialon_credentials(db, company_id)
+    try:
+        service = WialonReportService(base_url=creds["base_url"])
+        service.login(creds["wialon_token"])
+
+        groups = service.get_objects()
+        if not groups:
+            return {"status": "success", "detail": "No unit groups found", "rows": []}
+
+        group_id = groups[0].get("id")
+        now = int(time.time())
+        report_rows = service.run_report(
+            resource_id=FLEET_RESOURCE_ID,
+            template_id=FLEET_TEMPLATE_ID,
+            object_id=group_id,
+            start=now - 86400,
+            end=now,
+        )
+
+        raw = []
+        for row in (report_rows or [])[:limit]:
+            cols = row.get("c", [])
+            raw.append(
+                {
+                    "column_count": len(cols),
+                    # index -> value, so a shifted column is obvious at a glance
+                    "columns": {str(i): c for i, c in enumerate(cols)},
+                }
+            )
+
+        unit_ids = service.get_group_units(group_id)[:limit]
+        units = service.get_units_summary(unit_ids)
+        unit_fields = []
+        for u in units:
+            def _fields(container):
+                if isinstance(container, dict):
+                    values = container.values()
+                elif isinstance(container, list):
+                    values = container
+                else:
+                    values = []
+                return {
+                    str(f.get("n", "")): f.get("v", "")
+                    for f in values
+                    if isinstance(f, dict)
+                }
+
+            unit_fields.append(
+                {
+                    "id": u.get("id"),
+                    "name": u.get("nm"),
+                    "custom_fields": _fields(u.get("flds")),
+                    "profile_fields": _fields(u.get("pflds")),
+                }
+            )
+
+        return {
+            "status": "success",
+            "expected_column_map": {
+                "0": "vehicle name", "1": "code", "2": "vehicle type (Eng)",
+                "3": "vehicle type (Kh)", "4": "base location", "5": "project code",
+                "6": "mileage", "7": "engine hours", "8": "initial fuel",
+                "9": "fuel filled", "10": "fuel consumed", "11": "final fuel",
+                "12": "fuel standard",
+            },
+            "actual_report_rows": raw,
+            "unit_fields": unit_fields,
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
