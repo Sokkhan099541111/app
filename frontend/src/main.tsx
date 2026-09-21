@@ -4,6 +4,8 @@ import App from "./App";
 import { installApiFetchInterceptor } from "./utils/apiFetch";
 
 import "antd/dist/reset.css"; // ✅ IMPORTANT
+// After the reset, so the shared table rules win on a tie.
+import "./styles/tables.css";
 
 // Must run before any component fires its first /api/* fetch.
 installApiFetchInterceptor();

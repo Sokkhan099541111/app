@@ -25,6 +25,7 @@ from app.routes import (
     vehicle_financial_report_route,
     company_wialon_credential_route,
     dashboard_route,
+    advance_clearance_route,
     sales_route,
     auth,
     users,
@@ -97,6 +98,7 @@ app.include_router(payroll_entry_route.router, prefix="/api", dependencies=_guar
 app.include_router(payroll_report_route.router, prefix="/api", dependencies=_guard("payroll-report", "payroll-worksheet"))
 app.include_router(vehicle_rental_route.router, prefix="/api", dependencies=_guard("rental-vehicles", "rental-attendance", "rental-report"))
 app.include_router(sales_route.router, prefix="/api", dependencies=_guard("sales-performance", "sales-entry", "sales-master"))
+app.include_router(advance_clearance_route.router, prefix="/api", dependencies=_guard("advance-vouchers", "advance-master"))
 app.include_router(formula_route.router, prefix="/api", dependencies=_guard("settings-formula"))
 app.include_router(daily_kpi_route.router, prefix="/api", dependencies=_guard("daily-kpi"))
 app.include_router(vendor_route.router, prefix="/api", dependencies=_guard("settings-vendors"))

@@ -1,7 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
-import { Card, Button, Tooltip, message, Empty, DatePicker, Spin } from "antd";
-import { FileExcelOutlined, ReloadOutlined, FileTextOutlined, CaretUpOutlined, CaretDownOutlined } from "@ant-design/icons";
+import { Card, Button, Tooltip, message, Empty, Spin, Input } from "antd";
+import {
+  FileExcelOutlined,
+  ReloadOutlined,
+  FileTextOutlined,
+  CaretUpOutlined,
+  CaretDownOutlined,
+  SearchOutlined,
+} from "@ant-design/icons";
 import { useAuth } from "../src/context/AuthContext";
+import MonthRangePicker from "../src/components/MonthRangePicker";
+import { matchesVehicleSearch } from "../src/utils/vehicleLabel";
 import dayjs, { Dayjs } from "dayjs";
 import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { getLogoBuffer } from "../src/utils/companyLogo";
@@ -53,6 +62,7 @@ export default function RentalExpenseReport() {
   const [exportLoading, setExportLoading] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [vehicleSearch, setVehicleSearch] = useState("");
 
   useEffect(() => {
     loadReport();
@@ -92,9 +102,18 @@ export default function RentalExpenseReport() {
     }
   };
 
+  // Vehicle Code / Plate Number search, applied on top of whatever the
+  // month range already narrowed the data to. Filtering happens before
+  // sorting and before the totals, so the table, the TOTAL row and the
+  // Excel export all describe the same set of vehicles.
+  const filteredRentals = useMemo(() => {
+    if (!vehicleSearch.trim()) return rentals;
+    return rentals.filter((r) => matchesVehicleSearch(r, vehicleSearch));
+  }, [rentals, vehicleSearch]);
+
   const sortedRentals = useMemo(() => {
-    if (!sortKey) return rentals;
-    const list = [...rentals];
+    if (!sortKey) return filteredRentals;
+    const list = [...filteredRentals];
     list.sort((a, b) => {
       const cmp = STRING_SORT_KEYS.has(sortKey)
         ? String(a[sortKey] ?? "").localeCompare(String(b[sortKey] ?? ""))
@@ -102,10 +121,10 @@ export default function RentalExpenseReport() {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [rentals, sortKey, sortDir]);
+  }, [filteredRentals, sortKey, sortDir]);
 
   const totals = useMemo(() => {
-    return rentals.reduce(
+    return filteredRentals.reduce(
       (acc, r) => ({
         total_working: acc.total_working + Number(r.total_working ?? 0),
         total_on_standby: acc.total_on_standby + Number(r.total_on_standby ?? 0),
@@ -114,7 +133,7 @@ export default function RentalExpenseReport() {
       }),
       { total_working: 0, total_on_standby: 0, total_broken: 0, total_rental_expense: 0 }
     );
-  }, [rentals]);
+  }, [filteredRentals]);
 
   const days = useMemo(() => Array.from({ length: daysInMonth }, (_, i) => i + 1), [daysInMonth]);
 
@@ -157,7 +176,7 @@ export default function RentalExpenseReport() {
   });
 
   const handleExportExcel = async () => {
-    if (rentals.length === 0) {
+    if (sortedRentals.length === 0) {
       message.warning("There is no data to export.");
       return;
     }
@@ -183,7 +202,11 @@ export default function RentalExpenseReport() {
 
       sheet.mergeCells(1, 2, 1, totalColumns);
       const titleCell = sheet.getCell(1, 2);
-      titleCell.value = `Monthly Report Rental Expense - ${month.format("MMMM YYYY")}`;
+      // Name the vehicle filter in the title, so an exported file that
+      // holds only some of the fleet says so on its face.
+      titleCell.value =
+        `Monthly Report Rental Expense - ${month.format("MMMM YYYY")}` +
+        (vehicleSearch.trim() ? ` - Vehicle: ${vehicleSearch.trim()}` : "");
       titleCell.font = { size: 16, bold: true };
       titleCell.alignment = { vertical: "middle", horizontal: "center" };
 
@@ -275,14 +298,15 @@ export default function RentalExpenseReport() {
           <FileTextOutlined style={{ marginRight: 8 }} />
           Monthly Report Rental Expense
         </span>
-        <DatePicker
-          picker="month"
-          format="MMMM YYYY"
-          allowClear={false}
-          value={month}
-          onChange={(value) => value && setMonth(value.startOf("month"))}
-          style={{ flexShrink: 0, marginLeft: "auto" }}
+        <Input
+          allowClear
+          prefix={<SearchOutlined />}
+          placeholder="Search vehicle code or plate number..."
+          value={vehicleSearch}
+          onChange={(e) => setVehicleSearch(e.target.value)}
+          style={{ width: 280, flexShrink: 0, marginLeft: "auto" }}
         />
+        <MonthRangePicker month={month} onChange={setMonth} style={{ flexShrink: 0 }} />
         <Tooltip title="Refresh">
           <Button aria-label="Refresh" icon={<ReloadOutlined />} onClick={loadReport} style={{ flexShrink: 0 }} />
         </Tooltip>
@@ -293,7 +317,7 @@ export default function RentalExpenseReport() {
               icon={<FileExcelOutlined />}
               onClick={handleExportExcel}
               loading={exportLoading}
-              disabled={rentals.length === 0}
+              disabled={sortedRentals.length === 0}
               style={{ background: "#217346", borderColor: "#217346", color: "#fff", flexShrink: 0 }}
             />
           </Tooltip>
@@ -301,8 +325,14 @@ export default function RentalExpenseReport() {
       </div>
 
       <Spin spinning={loading}>
-      {rentals.length === 0 && !loading ? (
-        <Empty description="No active rental vehicles for this month." />
+      {sortedRentals.length === 0 && !loading ? (
+        <Empty
+          description={
+            vehicleSearch.trim()
+              ? `No rental vehicle matches "${vehicleSearch}" in this period.`
+              : "No active rental vehicles for this month."
+          }
+        />
       ) : (
         <div style={{ overflowX: "auto" }}>
           <table style={{ borderCollapse: "collapse", fontSize: 12, width: "max-content", minWidth: "100%" }}>

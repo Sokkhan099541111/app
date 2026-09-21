@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react';
 import dayjs from 'dayjs';
-import ExcelJS from 'exceljs';
 import { getLogoBuffer } from "../src/utils/companyLogo";
+import { loadExcelJS } from "../src/utils/loadExcelJS";
 import {
   Card,
   Table,
   Select,
   DatePicker,
+  Input,
   Button,
   Space,
   Alert,
@@ -15,6 +16,7 @@ import {
   Divider,
   message,
   Tooltip,
+  Tag,
 } from "antd";
 
 import {
@@ -31,8 +33,79 @@ const DATE_FORMAT = "YYYY-MM-DD";
 const REQUIRED_FIELDS_MESSAGE =
   "Please select an Object ID and Date before searching.";
 
+// The Remark column reflects the Rental Attendance Entry module: the status
+// recorded for that vehicle on the selected date. /reports/vehicles sends
+// `attendanceStatus` as "" when no attendance row exists, which is a real
+// answer -- "nobody has actioned this vehicle for this date" -- so it gets
+// its own label rather than an empty cell.
+const NO_ACTION_LABEL = "No Action";
+
+const ATTENDANCE_COLOR: Record<string, string> = {
+  Working: "green",
+  "On Standby": "gold",
+  Broken: "red",
+};
+
+const attendanceLabel = (status: string | null | undefined) =>
+  status && status.trim() ? status : NO_ACTION_LABEL;
+
 // Toggleable columns, grouped for display in the "Columns" picker.
 // "No" is intentionally excluded -- it's always shown as the row index.
+// --- Percentage (%) conditional formatting ---------------------------
+//
+// One place computes the percentage and one place decides its colour, so
+// the table cell, the column sorter and the Excel export can never
+// disagree about either. The formula itself is UNCHANGED -- this is the
+// same expression the column already used, only lifted out of the render.
+//
+//   (Fuel Filled - Fuel Filling) / Fuel Filled x 100, rounded
+//
+// A zero Fuel Filled reading yields 0%, not a division by zero.
+const percentageValue = (record: any): number => {
+  const fuelFilledLiters = record?.fuelFilledLiters ?? 0;
+  const fuelFilling = record?.fuelFilling ?? 0;
+  if (fuelFilledLiters === 0) return 0;
+  return Math.round(((fuelFilledLiters - fuelFilling) / fuelFilledLiters) * 100);
+};
+
+type PercentageSeverity = "normal" | "warning" | "critical";
+
+// below 5% -> default | 5%-10% inclusive -> yellow | above 10% -> red
+//
+// Measured on the SIZE of the gap, not its direction: the percentage says
+// how far Fuel Filling landed from Fuel Filled, and a 19% discrepancy is
+// equally worth flagging whichever way it went. So -19% and +19% are both
+// red, and the sign stays visible in the number itself.
+const percentageSeverity = (pct: number): PercentageSeverity => {
+  const gap = Math.abs(pct);
+  if (gap > 10) return "critical";
+  if (gap >= 5) return "warning";
+  return "normal";
+};
+
+// Filled cell background, with a text colour chosen for contrast against
+// it -- dark on yellow, white on red -- so the number stays readable
+// rather than disappearing into its own highlight.
+const PERCENTAGE_FILL: Record<
+  PercentageSeverity,
+  { background: string; text: string } | undefined
+> = {
+  normal: undefined,
+  warning: { background: "#ffd666", text: "#613400" },
+  critical: { background: "#ff4d4f", text: "#ffffff" },
+};
+
+// The same three states in ExcelJS's ARGB form (alpha first), for the
+// exported workbook.
+const PERCENTAGE_FILL_ARGB: Record<
+  PercentageSeverity,
+  { background: string; text: string } | undefined
+> = {
+  normal: undefined,
+  warning: { background: "FFFFD666", text: "FF613400" },
+  critical: { background: "FFFF4D4F", text: "FFFFFFFF" },
+};
+
 const COLUMN_GROUPS = [
   {
     title: "General",
@@ -83,7 +156,13 @@ const COLUMN_GROUPS = [
   },
   {
     title: "Other",
-    items: [{ key: "remarks", label: "Remark" }],
+    // "attendanceStatus" rather than "status": the API row already has a
+    // `status` field (the Wialon connectivity state -- Moving / Stopped /
+    // Offline), and reusing that key here would collide with it.
+    items: [
+      { key: "attendanceStatus", label: "Status" },
+      { key: "remarks", label: "Remark" },
+    ],
   },
 ];
 
@@ -97,6 +176,10 @@ function daily_Activities() {
   const [selectedUnitGroup, setSelectedUnitGroup] = useState('');
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
+  // Applied by the BACKEND, not by filtering the table client-side, so the
+  // report, the row count and the Excel export can never disagree about
+  // what "currently filtered" means.
+  const [vehicleSearch, setVehicleSearch] = useState('');
   const [vehicleData, setVehicleData] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [validationMessage, setValidationMessage] = useState<string | null>(null);
@@ -123,7 +206,7 @@ function daily_Activities() {
     setEndDate(today);
     setValidationMessage(null);
 
-    await fetchData(defaultGroupId, today, today);
+    await fetchData(defaultGroupId, today, today, '');
     setHasLoadedOnce(true);
   };
 
@@ -144,13 +227,20 @@ function daily_Activities() {
     }
   };
 
-  const fetchData = async (groupId: string, start: string, end: string) => {
+  // `search` is passed in rather than read from state: the clear button
+  // needs to fetch with an empty keyword in the same tick it clears the
+  // box, and a state update would not be visible yet.
+  const fetchData = async (groupId: string, start: string, end: string, search = '') => {
     setLoading(true);
     try {
       const params = new URLSearchParams();
       if (groupId) params.append('groupId', groupId);
       if (start) params.append('start', start);
       if (end) params.append('end', end);
+      // Trimmed here as well as on the server so a keyword of only spaces
+      // is never sent at all.
+      const trimmed = search.trim();
+      if (trimmed) params.append('vehicle_search', trimmed);
 
       const response = await fetch(`/api/reports/vehicles?${params}`);
       if (!response.ok) throw new Error(`Failed to fetch vehicles: ${response.statusText}`);
@@ -170,8 +260,21 @@ function daily_Activities() {
       return;
     }
     setValidationMessage(null);
+    // Back to page 1: staying on page 7 of a result set that just shrank to
+    // two pages would show an empty table and look like "no results".
     setCurrentPage(1);
-    fetchData(selectedUnitGroup, startDate, endDate);
+    fetchData(selectedUnitGroup, startDate, endDate, vehicleSearch);
+  };
+
+  // Clears the keyword and reloads the full report, leaving the group and
+  // date filters exactly as they are -- this resets the search, not the
+  // whole screen.
+  const handleClearSearch = () => {
+    setVehicleSearch('');
+    setCurrentPage(1);
+    if (selectedUnitGroup && startDate) {
+      fetchData(selectedUnitGroup, startDate, endDate, '');
+    }
   };
 
   const handleGroupChange = (value: string) => {
@@ -280,7 +383,11 @@ function daily_Activities() {
           title: "Working Hours",
           dataIndex: "workingHours",
           sorter: (a: any, b: any) => (a.workingHours ?? 0) - (b.workingHours ?? 0),
-          render: (workingHours: number) => `${(workingHours ?? 0).toFixed(2)} h`,
+          // Straight from the Vehicle Operation Log. Blank -- not "0.00 h"
+          // -- when no log in the selected range recorded one, so an
+          // unlogged vehicle never looks like one that worked zero hours.
+          render: (workingHours: number | null) =>
+            workingHours == null ? "" : `${workingHours.toFixed(2)} h`,
         },
         {
           title: "Fuel Filled (L)",
@@ -304,7 +411,10 @@ function daily_Activities() {
           title: "Total Mileage",
           dataIndex: "totalMileage",
           sorter: (a: any, b: any) => (a.totalMileage ?? 0) - (b.totalMileage ?? 0),
-          render: (totalMileage: number) => `${(totalMileage ?? 0).toLocaleString()} km`,
+          // Same contract as Working Hours above: the log's own value, and
+          // blank rather than "0 km" when there isn't one.
+          render: (totalMileage: number | null) =>
+            totalMileage == null ? "" : `${totalMileage.toLocaleString()} km`,
         },
       ],
     },
@@ -322,22 +432,22 @@ function daily_Activities() {
     {
       title: "Percentage",
       key: "percentage",
-      sorter: (a: any, b: any) => {
-        const pctA = (a.fuelFilledLiters ?? 0) !== 0
-          ? (((a.fuelFilledLiters ?? 0) - (a.fuelFilling ?? 0)) / (a.fuelFilledLiters ?? 0)) * 100
-          : 0;
-        const pctB = (b.fuelFilledLiters ?? 0) !== 0
-          ? (((b.fuelFilledLiters ?? 0) - (b.fuelFilling ?? 0)) / (b.fuelFilledLiters ?? 0)) * 100
-          : 0;
-        return pctA - pctB;
+      sorter: (a: any, b: any) => percentageValue(a) - percentageValue(b),
+      // The highlight goes on the <td> itself via onCell, not on a <span>
+      // inside render -- styling the rendered content would tint only the
+      // text's own box and leave the cell's padding uncoloured, so the
+      // "entire cell" would not actually be filled.
+      //
+      // Both are derived from the record on every render, so the colour
+      // follows the data through filtering, searching, sorting and
+      // pagination rather than being pinned to a row position.
+      onCell: (record: any) => {
+        const fill = PERCENTAGE_FILL[percentageSeverity(percentageValue(record))];
+        return fill
+          ? { style: { backgroundColor: fill.background, color: fill.text, fontWeight: 600 } }
+          : {};
       },
-      render: (_: any, record: any) => {
-        const fuelFilledLiters = record.fuelFilledLiters ?? 0;
-        const fuelFilling = record.fuelFilling ?? 0;
-        if (fuelFilledLiters === 0) return "0%";
-        const percentage = Math.round(((fuelFilledLiters - fuelFilling) / fuelFilledLiters) * 100);
-        return `${percentage}%`;
-      },
+      render: (_: any, record: any) => `${percentageValue(record)}%`,
     },
     {
       title: "GPS Daily Operation Report",
@@ -426,9 +536,35 @@ function daily_Activities() {
       ],
     },
     {
+      // Renamed from "Remark" to "Status". Only the LABEL and the column
+      // key change -- the value still comes from the Rental Attendance
+      // Entry via record.attendanceStatus, so no stored data moves or is
+      // rewritten. The column was always showing a status; the old name
+      // was the inaccurate part.
+      title: "Status",
+      dataIndex: "attendanceStatus",
+      key: "attendanceStatus",
+      width: 150,
+      sorter: (a: any, b: any) =>
+        attendanceLabel(a.attendanceStatus).localeCompare(attendanceLabel(b.attendanceStatus)),
+      render: (_: any, record: any) => (
+        <Tag color={ATTENDANCE_COLOR[record.attendanceStatus] ?? "default"}>
+          {attendanceLabel(record.attendanceStatus)}
+        </Tag>
+      ),
+    },
+    {
+      // The real Remark: free text the user types on the Vehicle
+      // Operation Log. Optional, so an empty value renders as a muted
+      // dash rather than being dressed up as missing data.
       title: "Remark",
       dataIndex: "remarks",
-      sorter: (a: any, b: any) => String(a.remarks ?? "").localeCompare(String(b.remarks ?? "")),
+      key: "remarks",
+      width: 200,
+      sorter: (a: any, b: any) =>
+        String(a.remarks ?? "").localeCompare(String(b.remarks ?? "")),
+      render: (v: string) =>
+        v ? v : <span style={{ color: "#bfbfbf" }}>-</span>,
     },
   ];
 
@@ -504,8 +640,13 @@ function daily_Activities() {
         return record.startTime ? dayjs(record.startTime).format("HH:mm") : "00:00";
       case "endTime":
         return record.endTime ? dayjs(record.endTime).format("HH:mm") : "00:00";
+      // Blank, not "0.00 h" / "0 km", when the operation log has no value
+      // -- matching the on-screen columns, so the export says the same
+      // thing the report does.
       case "workingHours":
-        return `${(record.workingHours ?? 0).toFixed(2)} h`;
+        return record.workingHours == null
+          ? ""
+          : `${record.workingHours.toFixed(2)} h`;
       case "fuelFilledLiters":
         return `${(record.fuelFilledLiters ?? 0).toLocaleString()} l`;
       case "initialMileage":
@@ -513,17 +654,15 @@ function daily_Activities() {
       case "finalMileage":
         return `${(record.finalMileage ?? 0).toLocaleString()} km`;
       case "totalMileage":
-        return `${(record.totalMileage ?? 0).toLocaleString()} km`;
+        return record.totalMileage == null
+          ? ""
+          : `${record.totalMileage.toLocaleString()} km`;
       case "variance": {
         const variance = (record.fuelFilledLiters ?? 0) - (record.fuelFilling ?? 0);
         return `${variance.toLocaleString()} l`;
       }
-      case "percentage": {
-        const fuelFilledLiters = record.fuelFilledLiters ?? 0;
-        const fuelFilling = record.fuelFilling ?? 0;
-        if (fuelFilledLiters === 0) return "0%";
-        return `${Math.round(((fuelFilledLiters - fuelFilling) / fuelFilledLiters) * 100)}%`;
-      }
+      case "percentage":
+        return `${percentageValue(record)}%`;
       case "mileage":
         return `${(record.mileage ?? 0).toLocaleString()} km`;
       case "engineHours":
@@ -553,6 +692,8 @@ function daily_Activities() {
         const over = actual <= 0 ? 0 : actual - standard;
         return `${over.toFixed(2)} L`;
       }
+      case "attendanceStatus":
+        return attendanceLabel(record.attendanceStatus);
       case "remarks":
         return record.remarks ?? "";
       default:
@@ -588,6 +729,8 @@ function daily_Activities() {
         }
       });
 
+      // Fetched on demand, not at page load -- see loadExcelJS().
+      const ExcelJS = await loadExcelJS();
       const workbook = new ExcelJS.Workbook();
       const sheet = workbook.addWorksheet("Daily Machinery Operation Report");
 
@@ -677,6 +820,21 @@ function daily_Activities() {
           cell.value = formatCellValue(leaf.key, record, index);
           cell.alignment = { vertical: "middle" };
           cell.border = thinBorder;
+
+          // Carry the on-screen Percentage colouring into the workbook, so
+          // an exported report flags the same rows as the report it was
+          // exported from. Driven by the same two helpers as the table.
+          if (leaf.key === "percentage") {
+            const fill = PERCENTAGE_FILL_ARGB[percentageSeverity(percentageValue(record))];
+            if (fill) {
+              cell.fill = {
+                type: "pattern",
+                pattern: "solid",
+                fgColor: { argb: fill.background },
+              };
+              cell.font = { color: { argb: fill.text }, bold: true };
+            }
+          }
         });
       });
 
@@ -742,6 +900,25 @@ function daily_Activities() {
             value={startDate ? dayjs(startDate) : null}
             onChange={handleDateChange}
             style={{ width: 160 }}
+          />
+
+          {/* One box for both Code and Plate Number -- the user does not
+              have to know which of the two they are holding. Enter runs the
+              search; the clear (x) restores the full report immediately,
+              because having to press Search again after clearing reads as
+              the clear not having worked. */}
+          <Input
+            allowClear
+            placeholder="Search vehicle code or plate..."
+            prefix={<SearchOutlined style={{ color: "#bfbfbf" }} />}
+            value={vehicleSearch}
+            onChange={(e) => {
+              const next = e.target.value;
+              setVehicleSearch(next);
+              if (next === "") handleClearSearch();
+            }}
+            onPressEnter={handleSearch}
+            style={{ width: 240 }}
           />
         </Space>
 
@@ -827,6 +1004,7 @@ function daily_Activities() {
         rowKey="key"
         bordered
         scroll={{ x: "max-content" }}
+        locale={{ emptyText: "No records found." }}
         pagination={{
           current: currentPage,
           pageSize: pageSize,

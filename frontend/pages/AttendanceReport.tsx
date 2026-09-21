@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { Card, Table, Button, Space, Select, notification, Tooltip, message } from "antd";
+import { Card, Table, Button, Space, Select, DatePicker, notification, Tooltip, message } from "antd";
 import { CloseCircleFilled, FileTextOutlined, FileExcelOutlined } from "@ant-design/icons";
 import { useAuth } from "../src/context/AuthContext";
-import dayjs from "dayjs";
+import dayjs, { Dayjs } from "dayjs";
 import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { useSearchParams } from "react-router-dom";
 import { getLogoBuffer } from "../src/utils/companyLogo";
@@ -62,7 +62,20 @@ export default function AttendanceReport() {
   const [loading, setLoading] = useState(false);
 
   const [filterEmployee, setFilterEmployee] = useState<number | "all">("all");
-  const [filterPeriod, setFilterPeriod] = useState<number | "all">("all");
+  // Date range replaces the old single-period dropdown. Defaults to TODAY;
+  // a dashboard drill-down (?year=&month=) still opens on that whole month.
+  // Any payroll period that overlaps the range is included, and the days
+  // shown are clipped to the range itself.
+  const [range, setRange] = useState<[Dayjs, Dayjs]>(() => {
+    const yearParam = searchParams.get("year");
+    const monthParam = searchParams.get("month");
+    if (yearParam && monthParam) {
+      const base = dayjs(`${yearParam}-${String(monthParam).padStart(2, "0")}-01`);
+      return [base.startOf("month"), base.endOf("month")];
+    }
+    const today = dayjs().startOf("day");
+    return [today, today];
+  });
   const [view, setView] = useState<ViewMode>("summary");
   const [exportLoading, setExportLoading] = useState(false);
 
@@ -74,7 +87,7 @@ export default function AttendanceReport() {
   useEffect(() => {
     loadAttendance();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filterEmployee, filterPeriod]);
+  }, [filterEmployee, range]);
 
   const loadEmployees = async () => {
     try {
@@ -95,19 +108,6 @@ export default function AttendanceReport() {
       const result = await response.json();
       const loadedPeriods = Array.isArray(result.data) ? result.data : [];
       setPeriods(loadedPeriods);
-
-      // Default to the current month's period, unless a specific
-      // year/month was requested via URL (dashboard drill-down).
-      const yearParam = searchParams.get("year");
-      const monthParam = searchParams.get("month");
-      const targetYear = yearParam ? Number(yearParam) : dayjs().year();
-      const targetMonth = monthParam ? Number(monthParam) : dayjs().month() + 1;
-      const currentPeriod = loadedPeriods.find(
-        (p: any) => p.period_year === targetYear && p.period_month === targetMonth
-      );
-      if (currentPeriod) {
-        setFilterPeriod(currentPeriod.payroll_period_id);
-      }
     } catch (error: any) {
       console.error("Error loading payroll periods:", error);
       notifyError("Couldn't load payroll periods", error.message);
@@ -119,7 +119,8 @@ export default function AttendanceReport() {
     try {
       const params = new URLSearchParams();
       if (filterEmployee !== "all") params.append("employee_id", String(filterEmployee));
-      if (filterPeriod !== "all") params.append("payroll_period_id", String(filterPeriod));
+      params.append("start", range[0].format("YYYY-MM-DD"));
+      params.append("end", range[1].format("YYYY-MM-DD"));
       const response = await fetch(`/api/attendance?${params}`);
       if (!response.ok) throw new Error(`Failed to fetch: ${response.statusText}`);
       const result = await response.json();
@@ -136,9 +137,15 @@ export default function AttendanceReport() {
     () => (filterEmployee === "all" ? employees : employees.filter((e) => e.employee_id === filterEmployee)),
     [employees, filterEmployee]
   );
+  // Every payroll period that overlaps the selected range.
   const filteredPeriods = useMemo(
-    () => (filterPeriod === "all" ? periods : periods.filter((p) => p.payroll_period_id === filterPeriod)),
-    [periods, filterPeriod]
+    () =>
+      periods.filter(
+        (p) =>
+          !dayjs(p.start_date).isAfter(range[1], "day") &&
+          !dayjs(p.end_date).isBefore(range[0], "day")
+      ),
+    [periods, range]
   );
 
   const attendanceByKey = useMemo(() => {
@@ -149,9 +156,13 @@ export default function AttendanceReport() {
     return map;
   }, [attendanceRows]);
 
+  // Days of a payroll period, clipped to the selected date range so a
+  // partial-month range reports only the days the user actually asked for.
   const periodDays = (period: any): string[] => {
-    const start = dayjs(period.start_date);
-    const end = dayjs(period.end_date);
+    const periodStart = dayjs(period.start_date);
+    const periodEnd = dayjs(period.end_date);
+    const start = periodStart.isBefore(range[0], "day") ? range[0].startOf("day") : periodStart;
+    const end = periodEnd.isAfter(range[1], "day") ? range[1].startOf("day") : periodEnd;
     const list: string[] = [];
     let cur = start;
     while (cur.isBefore(end) || cur.isSame(end, "day")) {
@@ -535,19 +546,14 @@ export default function AttendanceReport() {
               ...employees.map((e) => ({ label: e.full_name, value: e.employee_id })),
             ]}
           />
-          <Select
-            value={filterPeriod}
-            onChange={setFilterPeriod}
-            showSearch
-            optionFilterProp="label"
-            style={{ width: 180 }}
-            options={[
-              { label: "All periods", value: "all" },
-              ...periods.map((p) => ({
-                label: periodLabel(p),
-                value: p.payroll_period_id,
-              })),
-            ]}
+          <DatePicker.RangePicker
+            value={range}
+            onChange={(dates) => {
+              if (dates && dates[0] && dates[1]) setRange([dates[0], dates[1]]);
+            }}
+            allowClear={false}
+            format="YYYY-MM-DD"
+            style={{ width: 260 }}
           />
           <Select
             value={view}
@@ -574,7 +580,10 @@ export default function AttendanceReport() {
       }
     >
       <p style={{ color: "#666", marginTop: -8 }}>
-        Read-only reporting view -- filter by employee and period, switch between summary, calendar, and daily-list layouts.
+        Read-only reporting view -- showing {range[0].format("DD MMM YYYY")} to{" "}
+        {range[1].format("DD MMM YYYY")}
+        {filterEmployee === "all" ? " for all employees" : ""}. Filter by employee and date range,
+        switch between summary, calendar, and daily-list layouts.
       </p>
       <style>{`
         .compact-vehicle-table .ant-table {

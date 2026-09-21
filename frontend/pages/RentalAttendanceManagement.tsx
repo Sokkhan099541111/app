@@ -24,6 +24,25 @@ const STATUS_META: Record<StatusCode, { label: string; color: string; bg: string
   Broken: { label: "B", color: "#ffffff", bg: "#ff4d4f" },
 };
 
+// Shown when a rental vehicle has no Vehicle Code assigned in Wialon.
+const NO_VEHICLE_CODE = "No Vehicle Code";
+
+/**
+ * "VID-385 - TT10 3A-3893", or "No Vehicle Code - TT10 3A-3893" when the
+ * vehicle has no code.
+ *
+ * Single source of truth for how a rental vehicle is written in this
+ * module, so the dropdown and anything added later cannot drift apart.
+ */
+export const rentalVehicleLabel = (rental: {
+  code?: string | null;
+  plate_number?: string | null;
+}): string => {
+  const code = (rental.code || "").trim() || NO_VEHICLE_CODE;
+  const plate = (rental.plate_number || "").trim();
+  return plate ? `${code} - ${plate}` : code;
+};
+
 export default function RentalAttendanceManagement() {
   const { can } = useAuth();
   const canEdit = can("rental-attendance", "edit");
@@ -90,11 +109,23 @@ export default function RentalAttendanceManagement() {
 
   const arrivalDate = selectedRental?.arrival_date ? dayjs(selectedRental.arrival_date) : null;
 
+  // Shown as "VID-385 - TT10 3A-3893" (vehicle code, then plate number) so
+  // the vehicle is identifiable by either. `label` is what antd's
+  // optionFilterProp searches, so typing any part of the code OR the plate
+  // narrows the list -- e.g. "385", "VID", "TT10" and "3893" all match the
+  // example above.
+  //
+  // A vehicle with no code shows "No Vehicle Code - TT10 3A-3893" rather
+  // than the internal unit id it used to fall back to ("#385 - ..."). The
+  // plate is deliberately kept: substituting the whole label would leave
+  // the row unidentifiable, and several vehicles can be missing a code at
+  // once. It also states the problem in words someone can act on -- the
+  // code is assigned in Wialon, not here.
   const rentalOptions = useMemo(
     () =>
       rentals.map((r) => ({
         value: r.rental_id,
-        label: r.plate_number || r.code || `#${r.vehicles_id}`,
+        label: rentalVehicleLabel(r),
       })),
     [rentals]
   );
@@ -191,9 +222,9 @@ export default function RentalAttendanceManagement() {
           <Select
             showSearch
             allowClear
-            placeholder={rentalsLoading ? "Loading vehicles..." : "Select a rental vehicle..."}
+            placeholder={rentalsLoading ? "Loading vehicles..." : "Search vehicle code or plate number..."}
             optionFilterProp="label"
-            style={{ width: 260 }}
+            style={{ width: 300 }}
             value={rentalId}
             onChange={setRentalId}
             options={rentalOptions}

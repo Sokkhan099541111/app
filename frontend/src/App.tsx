@@ -20,6 +20,11 @@ import PayslipReport from "../pages/PayslipReport";
 import PayrollWorksheet from "../pages/PayrollWorksheet";
 import RentalVehicleManagement from "../pages/RentalVehicleManagement";
 import RentalAttendanceManagement from "../pages/RentalAttendanceManagement";
+import SalesPerformance from "../pages/SalesPerformance";
+import SalesEntry from "../pages/SalesEntry";
+import SalesMaster from "../pages/SalesMaster";
+import AdvanceVoucherManagement from "../pages/AdvanceVoucherManagement";
+import AdvanceMaster from "../pages/AdvanceMaster";
 import RentalExpenseReport from "../pages/RentalExpenseReport";
 import FormulaManagement from "../pages/FormulaManagement";
 import DailyKpiManagement from "../pages/DailyKpiManagement";
@@ -105,6 +110,11 @@ export default function App() {
                   {/* Vehicle Rental module */}
                   <Route path="/vehicles/rentals" element={<ProtectedRoute><RentalVehicleManagement /></ProtectedRoute>} />
                   <Route path="/vehicles/rental-attendance" element={<ProtectedRoute><RentalAttendanceManagement /></ProtectedRoute>} />
+                  <Route path="/sales/performance" element={<ProtectedRoute><SalesPerformance /></ProtectedRoute>} />
+                  <Route path="/sales/entry" element={<ProtectedRoute><SalesEntry /></ProtectedRoute>} />
+                  <Route path="/sales/master" element={<ProtectedRoute><SalesMaster /></ProtectedRoute>} />
+                  <Route path="/advance/vouchers" element={<ProtectedRoute><AdvanceVoucherManagement /></ProtectedRoute>} />
+                  <Route path="/advance/master" element={<ProtectedRoute><AdvanceMaster /></ProtectedRoute>} />
                   <Route path="/vehicles/rental-report" element={<ProtectedRoute><RentalExpenseReport /></ProtectedRoute>} />
                   <Route path="/vehicles/daily-kpi" element={<ProtectedRoute><DailyKpiManagement /></ProtectedRoute>} />
                   <Route path="/vehicles/expenses" element={<ProtectedRoute><VehicleExpenseManagement /></ProtectedRoute>} />

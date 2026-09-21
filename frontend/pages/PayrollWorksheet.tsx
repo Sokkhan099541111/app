@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { Card, Select, Button, Tooltip, message, Empty } from "antd";
-import { FileExcelOutlined, ReloadOutlined, TableOutlined, CaretUpOutlined, CaretDownOutlined } from "@ant-design/icons";
+import { Card, Button, Tooltip, message, Empty, Input } from "antd";
+import {
+  FileExcelOutlined,
+  ReloadOutlined,
+  TableOutlined,
+  CaretUpOutlined,
+  CaretDownOutlined,
+  SearchOutlined,
+} from "@ant-design/icons";
 import { useAuth } from "../src/context/AuthContext";
+import MonthRangePicker from "../src/components/MonthRangePicker";
 import { Link } from "react-router-dom";
 import dayjs from "dayjs";
 import { loadExcelJS } from "../src/utils/loadExcelJS";
@@ -79,6 +87,20 @@ export default function PayrollWorksheet() {
   const [exportLoading, setExportLoading] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [staffSearch, setStaffSearch] = useState("");
+
+  // The month the range picker should display: whichever payroll period is
+  // currently selected, falling back to the current month before the period
+  // list has loaded.
+  const selectedMonth = useMemo(() => {
+    const current = periods.find((p) => p.id === periodId);
+    if (current) {
+      return dayjs(
+        `${current.raw.period_year}-${String(current.raw.period_month).padStart(2, "0")}-01`
+      );
+    }
+    return dayjs().startOf("month");
+  }, [periods, periodId]);
 
   useEffect(() => {
     loadPeriods();
@@ -195,9 +217,20 @@ export default function PayrollWorksheet() {
     return map;
   }, [attendance]);
 
+  // Staff Name search. Filtering happens before sorting and before the
+  // totals are computed, so the table, the Total row and the Excel export
+  // all describe the same set of staff.
+  const filteredEmployees = useMemo(() => {
+    const q = staffSearch.trim().toLowerCase();
+    if (!q) return employees;
+    return employees.filter((e) =>
+      `${e.gender ?? ""} ${e.full_name ?? ""} ${e.employee_code ?? ""}`.toLowerCase().includes(q)
+    );
+  }, [employees, staffSearch]);
+
   const sortedEmployees = useMemo(() => {
-    if (!sortKey) return employees;
-    const list = [...employees];
+    if (!sortKey) return filteredEmployees;
+    const list = [...filteredEmployees];
     list.sort((a, b) => {
       const cmp = STRING_SORT_KEYS.has(sortKey)
         ? String(a[sortKey] ?? "").localeCompare(String(b[sortKey] ?? ""))
@@ -205,10 +238,10 @@ export default function PayrollWorksheet() {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return list;
-  }, [employees, sortKey, sortDir]);
+  }, [filteredEmployees, sortKey, sortDir]);
 
   const totals = useMemo(() => {
-    return employees.reduce(
+    return filteredEmployees.reduce(
       (acc, e) => ({
         total_basic_salary: acc.total_basic_salary + Number(e.total_basic_salary ?? 0),
         salary_per_day: acc.salary_per_day + Number(e.salary_per_day ?? 0),
@@ -230,10 +263,10 @@ export default function PayrollWorksheet() {
         total_salary_daily: 0,
       }
     );
-  }, [employees]);
+  }, [filteredEmployees]);
 
   const handleExportExcel = async () => {
-    if (employees.length === 0) {
+    if (sortedEmployees.length === 0) {
       message.warning("There is no data to export.");
       return;
     }
@@ -465,17 +498,38 @@ export default function PayrollWorksheet() {
             marginLeft: "auto",
           }}
         >
-        <Select
-          showSearch
-          placeholder="Select month..."
-          optionFilterProp="label"
-          value={periodId}
-          onChange={(value) => {
-            setPeriodId(value);
-            loadWorksheet(value);
+        <Input
+          allowClear
+          prefix={<SearchOutlined />}
+          placeholder="Search staff name..."
+          value={staffSearch}
+          onChange={(e) => setStaffSearch(e.target.value)}
+          style={{ width: 240, flexShrink: 0 }}
+        />
+        {/* Shown as a start-end range so the covered period is explicit and
+            the filter matches the other report screens. The worksheet is
+            still built from ONE payroll period -- salary, working days and
+            the day columns all come from it -- so picking any day selects
+            that whole month's period. */}
+        <MonthRangePicker
+          month={selectedMonth}
+          onChange={(firstOfMonth) => {
+            const match = periods.find(
+              (p) =>
+                p.raw.period_year === firstOfMonth.year() &&
+                p.raw.period_month === firstOfMonth.month() + 1
+            );
+            if (!match) {
+              message.warning(
+                `No payroll period exists for ${firstOfMonth.format("MMMM YYYY")}. ` +
+                  "Create it first under Payroll > Payroll Periods."
+              );
+              return;
+            }
+            setPeriodId(match.id);
+            loadWorksheet(match.id);
           }}
-          style={{ width: 220, flexShrink: 0 }}
-          options={periods.map((p) => ({ label: p.label, value: p.id }))}
+          style={{ flexShrink: 0 }}
         />
         <Tooltip title="Refresh">
           <Button

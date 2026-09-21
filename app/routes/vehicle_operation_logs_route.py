@@ -14,13 +14,15 @@ app/vehicle_operation_logs_add_status.sql instead):
     vehicle_id          INT UNSIGNED      -- Wialon avl_unit id
     operation_date      DATE
     project_code        VARCHAR(50) NULL  -- see app/vehicle_operation_logs_add_project_code.sql
+    base_location       VARCHAR(255) NOT NULL -- manually entered, required; see
+                                       -- app/vehicle_operation_logs_add_base_location.sql
     start_time          DATETIME
     end_time            DATETIME
     working_hours       DECIMAL(5,2)   -- manually entered by the user; see
                                        -- app/vehicle_operation_logs_manual_working_hours.sql
     initial_mileage     DECIMAL(10,2)
     final_mileage       DECIMAL(10,2)
-    total_mileage       VARCHAR(50)
+    total_mileage       DECIMAL(10,2)  -- auto-calculated, but user-overridable
     distance_travelled  DECIMAL(10,2)  GENERATED (final - initial mileage)
     fuel_filling_liters DECIMAL(10,2)
     remarks             TEXT
@@ -30,6 +32,15 @@ app/vehicle_operation_logs_add_status.sql instead):
 
 distance_travelled is still a MySQL GENERATED column -- never set it
 directly in INSERT/UPDATE, MySQL computes it from initial/final mileage.
+
+total_mileage is NOT the same thing, despite the similar arithmetic.
+distance_travelled is what the odometer readings imply; total_mileage is
+what the user asserts the trip was. They agree by default -- the form
+pre-fills total_mileage with final - initial -- but the user may override
+it (a swapped vehicle, a faulty odometer, a correction agreed after the
+fact), and whatever they type is stored verbatim and never recomputed
+server-side. Keeping both means a later disagreement is visible instead
+of one silently overwriting the other.
 
 working_hours USED to be generated too, but is now an ordinary column that
 the user types in (the entry form shows what the start/end times imply as
@@ -48,7 +59,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -82,21 +93,56 @@ VEHICLE_CODE_FIELD_NAMES = (
 
 # --- Request bodies ----------------------------------------------------
 
+def _clean_base_location(value: Optional[str]) -> str:
+    """Trim, and reject a value that is blank or only whitespace.
+
+    NOT NULL on the column stops a missing value, but " " satisfies it
+    while being just as useless to whoever reads the log later. Required
+    has to mean "has content", so the check belongs here rather than in
+    the schema."""
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise ValueError("Base Location is required")
+    return cleaned
+
+
 class VehicleOperationLogIn(BaseModel):
     vehicle_id: int
     operation_date: date
     project_code: Optional[str] = Field(None, max_length=50)
+    # Required, and required means non-blank -- see _clean_base_location.
+    base_location: str = Field(..., max_length=255)
     start_time: datetime
     end_time: datetime
     # Manually entered, NOT derived from start/end. Capped at 24 -- a
     # single day's operation log cannot exceed one day of hours, and the
     # DECIMAL(5,2) column would silently accept nonsense like 999.99.
     working_hours: Optional[float] = Field(None, ge=0, le=24)
-    initial_mileage: float = 0
-    final_mileage: float = 0
-    total_mileage: Optional[str] = None
+    # ge=0 on all three: an odometer reading and a distance are physical
+    # quantities that cannot be negative, and DECIMAL(10,2) would accept
+    # -500 without complaint.
+    initial_mileage: float = Field(0, ge=0)
+    final_mileage: float = Field(0, ge=0)
+    # Optional because the client may leave the total to the default
+    # calculation; when sent, it is the user's own figure and is stored
+    # exactly as given.
+    total_mileage: Optional[float] = Field(None, ge=0)
     fuel_filling_liters: float = 0
     remarks: Optional[str] = None
+
+    @field_validator("base_location")
+    @classmethod
+    def _base_location_not_blank(cls, v: str) -> str:
+        return _clean_base_location(v)
+
+    @model_validator(mode="after")
+    def _final_not_below_initial(self):
+        if self.final_mileage < self.initial_mileage:
+            raise ValueError(
+                "Final Mileage cannot be less than Initial Mileage "
+                f"({self.final_mileage} < {self.initial_mileage})"
+            )
+        return self
 
 
 class VehicleOperationLogUpdate(BaseModel):
@@ -104,17 +150,45 @@ class VehicleOperationLogUpdate(BaseModel):
     vehicle_id: Optional[int] = None
     operation_date: Optional[date] = None
     project_code: Optional[str] = Field(None, max_length=50)
+    base_location: Optional[str] = Field(None, max_length=255)
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     working_hours: Optional[float] = Field(None, ge=0, le=24)
-    initial_mileage: Optional[float] = None
-    final_mileage: Optional[float] = None
-    total_mileage: Optional[str] = None
+    initial_mileage: Optional[float] = Field(None, ge=0)
+    final_mileage: Optional[float] = Field(None, ge=0)
+    total_mileage: Optional[float] = Field(None, ge=0)
     fuel_filling_liters: Optional[float] = None
     remarks: Optional[str] = None
 
+    @field_validator("base_location")
+    @classmethod
+    def _base_location_not_blank(cls, v: Optional[str]) -> Optional[str]:
+        # None means "not being changed" and is fine. A value that IS sent
+        # must be usable -- editing the field to blank must fail, not quietly
+        # wipe a required field.
+        if v is None:
+            return None
+        return _clean_base_location(v)
+
 
 # --- Helpers -------------------------------------------------------------
+
+MISSING_COLUMN_HINT = (
+    "The vehicle_operation_logs table is missing a column this version "
+    "needs. Run app/vehicle_operation_logs_add_base_location.sql against "
+    "the database, then try again."
+)
+
+
+def _db_error_detail(e: Exception, action: str) -> str:
+    """Unknown-column errors mean an un-run migration, not a bug in the
+    request. Saying so turns an opaque 500 into something the operator can
+    act on instead of reporting."""
+    message = str(e)
+    if "Unknown column" in message:
+        return f"{MISSING_COLUMN_HINT} ({message})"
+    return f"Could not {action}: {message}"
+
 
 def _row_to_dict(row) -> dict:
     return dict(row._mapping)
@@ -460,11 +534,13 @@ def create_vehicle_log(payload: VehicleOperationLogIn, db: Session = Depends(get
             text(
                 """
                 INSERT INTO vehicle_operation_logs
-                    (vehicle_id, operation_date, project_code, start_time, end_time,
+                    (vehicle_id, operation_date, project_code, base_location,
+                     start_time, end_time,
                      working_hours, initial_mileage, final_mileage, total_mileage,
                      fuel_filling_liters, remarks)
                 VALUES
-                    (:vehicle_id, :operation_date, :project_code, :start_time, :end_time,
+                    (:vehicle_id, :operation_date, :project_code, :base_location,
+                     :start_time, :end_time,
                      :working_hours, :initial_mileage, :final_mileage, :total_mileage,
                      :fuel_filling_liters, :remarks)
                 """
@@ -475,7 +551,7 @@ def create_vehicle_log(payload: VehicleOperationLogIn, db: Session = Depends(get
         return {"status": "success", "data": _fetch_log(db, result.lastrowid)}
     except SQLAlchemyError as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Could not create log: {e}")
+        raise HTTPException(status_code=500, detail=_db_error_detail(e, "create log"))
 
 
 @router.put("/vehicle-logs/{log_id}")
@@ -505,6 +581,21 @@ def update_vehicle_log(
                 ),
             )
 
+    # Final >= Initial has to be checked against the record as it WILL be,
+    # not against the payload alone. A PUT that changes only initial_mileage
+    # is individually valid yet can still leave the row inconsistent, and
+    # the field-level validators cannot see the columns that weren't sent.
+    effective_initial = updates.get("initial_mileage", current.get("initial_mileage") or 0)
+    effective_final = updates.get("final_mileage", current.get("final_mileage") or 0)
+    if float(effective_final) < float(effective_initial):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Final Mileage cannot be less than Initial Mileage "
+                f"({effective_final} < {effective_initial})"
+            ),
+        )
+
     set_clause = ", ".join(f"{col} = :{col}" for col in updates)
     updates["log_id"] = log_id
 
@@ -517,7 +608,9 @@ def update_vehicle_log(
         return {"status": "success", "data": _fetch_log(db, log_id)}
     except SQLAlchemyError as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Could not update log {log_id}: {e}")
+        raise HTTPException(
+            status_code=500, detail=_db_error_detail(e, f"update log {log_id}")
+        )
 
 
 @router.delete("/vehicle-logs/{log_id}")

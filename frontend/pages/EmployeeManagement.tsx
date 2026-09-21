@@ -32,6 +32,7 @@ import dayjs from "dayjs";
 import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 import { useAuth } from "../src/context/AuthContext";
+import { vehicleSelectOptions, vehicleLabelById } from "../src/utils/vehicleLabel";
 import EmployeeForm from "./EmployeeForm";
 import type { EmployeeFormValues, OptionRecord } from "./EmployeeForm";
 import type { VehicleOption } from "./VehicleOperationLogForm";
@@ -276,11 +277,9 @@ export default function EmployeeManagement() {
     return "default";
   };
 
-  const vehicleDisplay = (vehiclesId: number | null | undefined) => {
-    if (vehiclesId == null) return "-";
-    const match = vehicleOptions.find((v) => v.id === vehiclesId);
-    return match ? match.name : String(vehiclesId);
-  };
+  // Same "VID-385 - TT10 3A-3893" label the vehicle filter uses.
+  const vehicleDisplay = (vehiclesId: number | null | undefined) =>
+    vehicleLabelById(vehicleOptions, vehiclesId);
 
   const allColumns = [
     {
@@ -615,10 +614,10 @@ export default function EmployeeManagement() {
             showSearch
             value={filterVehicleId}
             onChange={(value) => setFilterVehicleId(value)}
-            placeholder="Filter by vehicle..."
+            placeholder="Search vehicle code or plate number..."
             optionFilterProp="label"
-            style={{ width: 180, flexShrink: 0 }}
-            options={vehicleOptions.map((v) => ({ value: v.id, label: v.name }))}
+            style={{ width: 280, flexShrink: 0 }}
+            options={vehicleSelectOptions(vehicleOptions)}
           />
 
           <Select

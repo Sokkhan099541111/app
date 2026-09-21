@@ -55,7 +55,6 @@ from app.routes.vehicle_financial_report_route import (
     ENGINE_OIL_CATEGORY,
     OTHER_CATEGORY,
     REPAIR_CATEGORY,
-    _clamp_kpi_achieved,
     _expenses_by_vehicle,
     _get_all_vehicles_enriched,
     _rental_expense_and_status_by_vehicle,
@@ -65,6 +64,24 @@ from app.routes.vehicle_financial_report_route import (
 )
 
 router = APIRouter()
+
+
+def _clamp_kpi_achieved(profit_plus_bonus: float) -> float:
+    """Per-vehicle KPI score, floored at 0 and capped at 200.
+
+    Lives here rather than in the financial report module because the
+    "Avg KPI achievement" card is now its only consumer -- the report's
+    own KPI Achieved column was removed, and its Monthly KPI is a
+    percentage of profit, a different measure entirely.
+
+    Kept exactly as it was so this card's number does not move: the 200
+    cap is the scale the percentage below divides by.
+    """
+    if profit_plus_bonus > 200:
+        return 200.0
+    if profit_plus_bonus <= 0:
+        return 0.0
+    return profit_plus_bonus
 
 MAX_RANGE_MONTHS = 24
 
@@ -143,15 +160,6 @@ def _month_financials(db: Session, year: int, month: int, vehicles: list) -> dic
     avg_kpi_pct = (
         round(sum(kpi_achieved_values) / len(kpi_achieved_values) / 200 * 100, 1) if kpi_achieved_values else 0.0
     )
-    # The KPI Achievement AMOUNT, alongside the percentage above. Same
-    # per-vehicle figure the Monthly Vehicle Financial & KPI Performance
-    # Report shows in its "KPI Achieved" column (and totals) -- already
-    # clamped to 0..200 per vehicle by _clamp_kpi_achieved -- just summed
-    # fleet-wide. Nothing here recomputes the KPI; it reuses the values
-    # collected in the loop above, so the dashboard and the report cannot
-    # disagree.
-    total_kpi_achieved = round(sum(kpi_achieved_values), 2)
-
     return {
         "total_revenue": round(total_revenue, 2),
         "total_expenses": total_expenses,
@@ -165,7 +173,6 @@ def _month_financials(db: Session, year: int, month: int, vehicles: list) -> dic
         "payroll_cost": round(total_salary, 2),
         "rental_expense": round(total_rental, 2),
         "avg_kpi_achievement_pct": avg_kpi_pct,
-        "total_kpi_achieved": total_kpi_achieved,
     }
 
 
@@ -181,10 +188,6 @@ def _aggregate_month_financials(monthly_breakdown: list, vehicle_count: int) -> 
         "expense_breakdown": {"repair": 0.0, "engine_oil": 0.0, "diesel": 0.0, "other": 0.0},
         "payroll_cost": 0.0,
         "rental_expense": 0.0,
-        # Summed across the months in range, like revenue and expenses --
-        # a multi-month KPI Achievement is the total earned over the
-        # period, not an average of the monthly figures.
-        "total_kpi_achieved": 0.0,
     }
     kpi_pct_values = []
     for mf in monthly_breakdown:
@@ -195,7 +198,6 @@ def _aggregate_month_financials(monthly_breakdown: list, vehicle_count: int) -> 
             totals["expense_breakdown"][k] += mf["expense_breakdown"][k]
         totals["payroll_cost"] += mf["payroll_cost"]
         totals["rental_expense"] += mf["rental_expense"]
-        totals["total_kpi_achieved"] += mf["total_kpi_achieved"]
         kpi_pct_values.append(mf["avg_kpi_achievement_pct"])
 
     avg_kpi_pct = round(sum(kpi_pct_values) / len(kpi_pct_values), 1) if kpi_pct_values else 0.0
@@ -209,7 +211,6 @@ def _aggregate_month_financials(monthly_breakdown: list, vehicle_count: int) -> 
         "payroll_cost": round(totals["payroll_cost"], 2),
         "rental_expense": round(totals["rental_expense"], 2),
         "avg_kpi_achievement_pct": avg_kpi_pct,
-        "total_kpi_achieved": round(totals["total_kpi_achieved"], 2),
     }
 
 

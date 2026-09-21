@@ -4,6 +4,7 @@ import { CheckCircleFilled, CloseCircleFilled, CalendarOutlined } from "@ant-des
 import { useAuth } from "../src/context/AuthContext";
 import { useSearchParams } from "react-router-dom";
 import dayjs from "dayjs";
+import type { VehicleOption } from "../src/utils/vehicleLabel";
 
 const notifyError = (title: string, description?: string) =>
   notification.error({
@@ -27,6 +28,39 @@ const STATUS_META: Record<StatusCode, { label: string; color: string; bg: string
   L: { label: "L", color: "#ffffff", bg: "#f59e0b" },
 };
 
+// Shown when an employee's assigned vehicle has no Vehicle Code in Wialon.
+const NO_VEHICLE_CODE = "No Vehicle Code";
+
+/**
+ * "VID-385 - TT10 3A-3893 - DEN SEN" -- vehicle code, plate number, then
+ * the employee's name.
+ *
+ * Employees carry a `vehicles_id` (a Wialon unit id); the code and plate
+ * live in Wialon, not in the employees table, so they are looked up from
+ * the vehicle list this page loads alongside the employees.
+ *
+ * Degrades a segment at a time rather than all-or-nothing, because each
+ * piece can be missing independently and the name must stay readable:
+ *   - no code            -> "No Vehicle Code - TT10 3A-3893 - DEN SEN"
+ *   - no plate           -> "VID-385 - DEN SEN"
+ *   - no vehicle at all  -> "DEN SEN"
+ * The last case covers an employee with no vehicles_id AND the window
+ * before the vehicle list arrives -- writing "No Vehicle Code" there would
+ * assert something about the vehicle that has not been checked yet.
+ */
+export const employeeVehicleLabel = (
+  employee: { full_name?: string | null; vehicles_id?: number | null },
+  vehiclesById: Map<number, VehicleOption>
+): string => {
+  const name = (employee.full_name || "").trim() || "-";
+  const vehicle = employee.vehicles_id != null ? vehiclesById.get(employee.vehicles_id) : undefined;
+  if (!vehicle) return name;
+
+  const code = (vehicle.code || "").trim() || NO_VEHICLE_CODE;
+  const plate = (vehicle.name || "").trim();
+  return plate ? `${code} - ${plate} - ${name}` : `${code} - ${name}`;
+};
+
 const MONTH_NAMES = [
   "January",
   "February",
@@ -47,6 +81,7 @@ export default function AttendanceManagement() {
   const canEdit = can("payroll-attendance", "edit");
   const [searchParams] = useSearchParams();
   const [employees, setEmployees] = useState<any[]>([]);
+  const [vehicles, setVehicles] = useState<VehicleOption[]>([]);
   const [periods, setPeriods] = useState<any[]>([]);
   const [employeeId, setEmployeeId] = useState<number | undefined>(undefined);
   const [periodId, setPeriodId] = useState<number | undefined>(undefined);
@@ -63,6 +98,7 @@ export default function AttendanceManagement() {
     if (periodParam) setPeriodId(Number(periodParam));
 
     loadEmployees();
+    loadVehicles();
     loadPeriods();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -85,6 +121,22 @@ export default function AttendanceManagement() {
     } catch (error: any) {
       console.error("Error loading employees:", error);
       notifyError("Couldn't load employees", error.message);
+    }
+  };
+
+  // The vehicle code and plate number shown in the employee dropdown come
+  // from Wialon, not the employees table -- the same endpoint every other
+  // vehicle picker uses. A failure here is NOT fatal: the dropdown falls
+  // back to plain employee names, so attendance can still be marked.
+  const loadVehicles = async () => {
+    try {
+      const response = await fetch("/api/vehicle-logs/vehicle-options");
+      if (!response.ok) throw new Error(`Failed to fetch vehicles: ${response.statusText}`);
+      const result = await response.json();
+      setVehicles(Array.isArray(result.vehicles) ? result.vehicles : []);
+    } catch (error: any) {
+      console.error("Error loading vehicle options:", error);
+      setVehicles([]);
     }
   };
 
@@ -146,12 +198,25 @@ export default function AttendanceManagement() {
     return periodKey > currentKey;
   }, [selectedPeriod]);
 
+  const vehiclesById = useMemo(
+    () => new Map(vehicles.map((v) => [v.id, v])),
+    [vehicles]
+  );
+
+  // Labelled "VID-385 - TT10 3A-3893 - DEN SEN". `label` is what antd's
+  // optionFilterProp searches, so typing any part of the code, the plate
+  // OR the name narrows the list -- "VID", "385", "TT10", "3893" and "SEN"
+  // all match the example above.
+  //
+  // The option VALUE is still employee_id, so the deep link from Payroll
+  // Worker by Month, the attendance queries and everything saved against a
+  // day are unaffected -- only what is displayed changes.
   const employeeOptions = useMemo(
     () =>
       (isFuturePeriod ? employees.filter((e) => e.employment_status === "Active") : employees).map(
-        (e) => ({ label: e.full_name, value: e.employee_id })
+        (e) => ({ label: employeeVehicleLabel(e, vehiclesById), value: e.employee_id })
       ),
-    [employees, isFuturePeriod]
+    [employees, isFuturePeriod, vehiclesById]
   );
 
   // If the currently selected employee drops out of the list (e.g. they
@@ -267,9 +332,9 @@ export default function AttendanceManagement() {
           <Select
             showSearch
             allowClear
-            placeholder="Select an employee..."
+            placeholder="Search vehicle code, plate or employee..."
             optionFilterProp="label"
-            style={{ width: 220 }}
+            style={{ width: 340 }}
             value={employeeId}
             onChange={setEmployeeId}
             options={employeeOptions}

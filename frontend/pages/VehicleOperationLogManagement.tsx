@@ -32,6 +32,7 @@ import dayjs from "dayjs";
 import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 import { useAuth } from "../src/context/AuthContext";
+import { vehicleSelectOptions, vehicleLabelById } from "../src/utils/vehicleLabel";
 import VehicleOperationLogForm from "./VehicleOperationLogForm";
 import type {
   VehicleOption,
@@ -71,6 +72,8 @@ const TOGGLEABLE_COLUMNS = [
   { key: "operation_date", label: "Date" },
   { key: "vehicle_id", label: "Plate Number" },
   { key: "vehicle_type", label: "Vehicle Type" },
+  { key: "project_code", label: "Project Code" },
+  { key: "base_location", label: "Base Location" },
   { key: "start_time", label: "Start Time" },
   { key: "end_time", label: "End Time" },
   { key: "working_hours", label: "Working Hours" },
@@ -78,7 +81,7 @@ const TOGGLEABLE_COLUMNS = [
   { key: "final_mileage", label: "Final Mileage" },
   { key: "total_mileage", label: "Total Mileage" },
   { key: "fuel_filling_liters", label: "Fuel Filled (L)" },
-  { key: "remarks", label: "Remarks" },
+  { key: "remarks", label: "Remark" },
 ];
 const ALL_TOGGLEABLE_KEYS = TOGGLEABLE_COLUMNS.map((c) => c.key);
 
@@ -105,14 +108,17 @@ export default function VehicleOperationLogManagement() {
 
   // Filters -- status defaults to "Active" so soft-deleted logs stay
   // hidden unless the user explicitly asks to see them. Date range
-  // defaults to yesterday on first load (see useEffect below).
+  // defaults to today on first load (see useEffect below).
   const [filterVehicleId, setFilterVehicleId] = useState<number | undefined>(undefined);
   const [filterDateRange, setFilterDateRange] = useState<[string, string] | null>(null);
   const [filterStatus, setFilterStatus] = useState<StatusFilter>("Active");
 
   useEffect(() => {
-    const yesterday = dayjs().subtract(1, "day").format(DATE_FORMAT);
-    const defaultRange: [string, string] = [yesterday, yesterday];
+    // Default to TODAY (start = end = today). Computed fresh inside the
+    // effect rather than at module load, so a tab left open overnight picks
+    // up the new date on refresh instead of pinning yesterday.
+    const today = dayjs().format(DATE_FORMAT);
+    const defaultRange: [string, string] = [today, today];
     setFilterDateRange(defaultRange);
 
     loadVehicleOptions();
@@ -182,8 +188,8 @@ export default function VehicleOperationLogManagement() {
     loadLogs(filterVehicleId, filterDateRange, filterStatus);
   };
 
-  const vehicleName = (vehicleId: number) =>
-    vehicleOptions.find((v) => v.id === vehicleId)?.name ?? vehicleId;
+  // Same "VID-385 - TT10 3A-3893" label the vehicle filter uses.
+  const vehicleName = (vehicleId: number) => vehicleLabelById(vehicleOptions, vehicleId);
 
   const vehicleType = (vehicleId: number) => vehicleTypes[vehicleId] || "-";
 
@@ -280,6 +286,26 @@ export default function VehicleOperationLogManagement() {
       render: (vehicleId: number) => vehicleType(vehicleId),
     },
     {
+      title: "Project Code",
+      dataIndex: "project_code",
+      key: "project_code",
+      width: 120,
+      sorter: (a: any, b: any) =>
+        String(a.project_code ?? "").localeCompare(String(b.project_code ?? "")),
+      render: (v: string) => v || "-",
+    },
+    {
+      title: "Base Location",
+      dataIndex: "base_location",
+      key: "base_location",
+      width: 160,
+      sorter: (a: any, b: any) =>
+        String(a.base_location ?? "").localeCompare(String(b.base_location ?? "")),
+      // Rows created before the base_location migration have no value.
+      // "-" says "not recorded" without pretending it is blank on purpose.
+      render: (v: string) => v || "-",
+    },
+    {
       title: "Start Time",
       dataIndex: "start_time",
       key: "start_time",
@@ -322,7 +348,7 @@ export default function VehicleOperationLogManagement() {
       key: "fuel_filling_liters",
       render: (v: number) => (v != null ? `${Number(v).toLocaleString()} l` : "-"),
     },
-    { title: "Remarks", dataIndex: "remarks", key: "remarks" },
+    { title: "Remark", dataIndex: "remarks", key: "remarks" },
     {
       title: "Status",
       dataIndex: "status",
@@ -419,6 +445,10 @@ export default function VehicleOperationLogManagement() {
         return record.fuel_filling_liters != null
           ? `${Number(record.fuel_filling_liters).toLocaleString()} l`
           : "-";
+      case "project_code":
+        return record.project_code ?? "";
+      case "base_location":
+        return record.base_location ?? "";
       case "remarks":
         return record.remarks ?? "";
       case "status":
@@ -566,25 +596,35 @@ export default function VehicleOperationLogManagement() {
           }}
         >
           <Select
-            placeholder="Filter by plate number..."
+            placeholder="Search vehicle code or plate number..."
             value={filterVehicleId}
             onChange={setFilterVehicleId}
             allowClear
             showSearch
             optionFilterProp="label"
-            style={{ width: 200, flexShrink: 0 }}
-            options={vehicleOptions.map((v) => ({ label: v.name, value: v.id }))}
+            style={{ width: 280, flexShrink: 0 }}
+            options={vehicleSelectOptions(vehicleOptions)}
           />
 
+          {/* The range is read from the Dayjs values and formatted with
+              DATE_FORMAT explicitly, NOT from antd's `dateStrings`. Those
+              strings come back in the picker's *display* format, so without
+              a pinned format the API received whatever the locale rendered
+              (e.g. "31/08/2026") instead of the YYYY-MM-DD it parses --
+              which is why filtering silently returned nothing. */}
           <RangePicker
+            format={DATE_FORMAT}
             value={
               filterDateRange
                 ? [dayjs(filterDateRange[0]), dayjs(filterDateRange[1])]
                 : null
             }
-            onChange={(_, dateStrings) => {
-              if (dateStrings[0] && dateStrings[1]) {
-                setFilterDateRange([dateStrings[0], dateStrings[1]]);
+            onChange={(dates) => {
+              if (dates?.[0] && dates?.[1]) {
+                setFilterDateRange([
+                  dates[0].format(DATE_FORMAT),
+                  dates[1].format(DATE_FORMAT),
+                ]);
               } else {
                 setFilterDateRange(null);
               }

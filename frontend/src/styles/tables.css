@@ -1,0 +1,27 @@
+/* ---------------------------------------------------------------------
+   Compact table styling, shared by every data table in the app.
+
+   Loaded from main.tsx, AFTER antd's reset so it wins on a tie.
+
+   Why this file exists: the rule was previously copy-pasted into a
+   <style> block inside 21 separate pages. A page that used the
+   `compact-vehicle-table` class but forgot the block -- the Advance
+   Clearance screens -- silently rendered at antd's default size while
+   every other table was 12px. One definition makes the class mean the
+   same thing everywhere.
+
+   NOT added to src/index.css: that file is unimported template
+   boilerplate (dark mode, purple accent, 18px base font), and importing
+   it to reach one rule would restyle the whole application.
+   ------------------------------------------------------------------ */
+.compact-vehicle-table .ant-table {
+  font-size: 12px;
+}
+.compact-vehicle-table .ant-table-thead > tr > th {
+  font-size: 12px;
+  padding: 6px 8px;
+}
+.compact-vehicle-table .ant-table-tbody > tr > td {
+  font-size: 12px;
+  padding: 6px 8px;
+}

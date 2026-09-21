@@ -15,6 +15,8 @@ import {
   Tooltip,
   message,
   Descriptions,
+  Row,
+  Col,
 } from "antd";
 import {
   PlusOutlined,
@@ -27,12 +29,15 @@ import {
   FileExcelOutlined,
   SaveOutlined,
   CloseOutlined,
+  SearchOutlined,
+  LoadingOutlined,
 } from "@ant-design/icons";
 import dayjs, { Dayjs } from "dayjs";
 import { loadExcelJS } from "../src/utils/loadExcelJS";
 import { useSearchParams } from "react-router-dom";
 import { getLogoBuffer } from "../src/utils/companyLogo";
 import { useAuth } from "../src/context/AuthContext";
+import { vehicleSelectOptions, matchesVehicleSearch } from "../src/utils/vehicleLabel";
 
 const notifySuccess = (title: string, description?: string) =>
   notification.success({
@@ -54,11 +59,21 @@ const notifyError = (title: string, description?: string) =>
     style: { borderRadius: 10 },
   });
 
+// Explains WHY the mileage fields are locked, so a disabled field is not
+// mistaken for a broken one.
+const vehicleGroupNote = (vehicleId: unknown, group: string | null): string => {
+  if (!vehicleId) return "Select a vehicle first.";
+  if (!group) return "Vehicle Group not set -- mileage does not apply.";
+  return `Vehicle Group is "${group}" -- mileage applies to "Assigned" only.`;
+};
+
 const money = (v: number) => `$ ${Number(v ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
 
 interface VehicleOption {
   id: number;
   name: string;
+  /** Fleet code, e.g. VID-385. Supplied by /vehicle-logs/vehicle-options. */
+  code?: string;
 }
 
 export default function DailyKpiManagement() {
@@ -70,13 +85,21 @@ export default function DailyKpiManagement() {
 
   const [searchParams] = useSearchParams();
   const [rows, setRows] = useState<any[]>([]);
+  const [vehicleSearch, setVehicleSearch] = useState("");
   const [vehicleOptions, setVehicleOptions] = useState<VehicleOption[]>([]);
   const [workTypes, setWorkTypes] = useState<any[]>([]);
-  const [month, setMonth] = useState<Dayjs>(() => {
+  // Date range filter. Defaults to TODAY -- this is a daily entry screen,
+  // so the day you are working on is what you want to see first.
+  // A ?year=&month= link from the Dashboard still opens that whole month.
+  const [range, setRange] = useState<[Dayjs, Dayjs]>(() => {
     const y = searchParams.get("year");
     const m = searchParams.get("month");
-    if (y && m) return dayjs(`${y}-${String(m).padStart(2, "0")}-01`);
-    return dayjs().startOf("month");
+    if (y && m) {
+      const first = dayjs(`${y}-${String(m).padStart(2, "0")}-01`);
+      return [first.startOf("month"), first.endOf("month")];
+    }
+    const today = dayjs().startOf("day");
+    return [today, today];
   });
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -86,6 +109,62 @@ export default function DailyKpiManagement() {
   const [form] = Form.useForm();
   const selectedWorkTypeId = Form.useWatch("work_type_id", form);
   const dailyProductivity = Form.useWatch("daily_productivity", form);
+  const selectedVehicleId = Form.useWatch("vehicles_id", form);
+  const mileage = Form.useWatch("mileage", form);
+  const amountPerKm = Form.useWatch("amount_per_km", form);
+
+  // --- Vehicle Group ("Assigned" unlocks the mileage fields) ------------
+  // Read from the vehicle's Wialon custom field. Starts as null/false so
+  // the fields are DISABLED until the lookup confirms "Assigned" -- failing
+  // closed, since enabling them wrongly would attach mileage earnings to a
+  // vehicle that is not on mileage terms.
+  const [vehicleGroup, setVehicleGroup] = useState<string | null>(null);
+  const [isAssignedVehicle, setIsAssignedVehicle] = useState(false);
+  const [groupLookupLoading, setGroupLookupLoading] = useState(false);
+
+  useEffect(() => {
+    if (!isModalVisible || !selectedVehicleId) {
+      setVehicleGroup(null);
+      setIsAssignedVehicle(false);
+      return;
+    }
+
+    let cancelled = false;
+    setGroupLookupLoading(true);
+
+    (async () => {
+      let group: string | null = null;
+      let assigned = false;
+      try {
+        const response = await fetch(
+          `/api/daily-kpi-entries/vehicle-group?vehicles_id=${selectedVehicleId}`
+        );
+        if (response.ok) {
+          const data = await response.json();
+          group = data?.vehicle_group ?? null;
+          assigned = Boolean(data?.is_assigned);
+        }
+      } catch {
+        // Leave it unassigned -- see the fail-closed note above.
+      } finally {
+        if (!cancelled) {
+          setVehicleGroup(group);
+          setIsAssignedVehicle(assigned);
+          // Clear stale mileage figures when switching to a vehicle that
+          // is not on mileage terms, so a disabled field can never carry a
+          // leftover value into the save.
+          if (!assigned) {
+            form.setFieldsValue({ mileage: undefined, amount_per_km: undefined });
+          }
+          setGroupLookupLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isModalVisible, selectedVehicleId, form]);
 
   useEffect(() => {
     loadVehicleOptions();
@@ -96,7 +175,14 @@ export default function DailyKpiManagement() {
   useEffect(() => {
     loadRows();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [month]);
+  }, [range]);
+
+  // Vehicle Code / Plate Number search over the loaded rows. The table and
+  // the Excel export both read this, so what you see is what you export.
+  const filteredRows = useMemo(() => {
+    if (!vehicleSearch.trim()) return rows;
+    return rows.filter((r) => matchesVehicleSearch(r, vehicleSearch));
+  }, [rows, vehicleSearch]);
 
   const loadVehicleOptions = async () => {
     try {
@@ -138,8 +224,8 @@ export default function DailyKpiManagement() {
     setLoading(true);
     try {
       const params = new URLSearchParams({
-        year: String(month.year()),
-        month: String(month.month() + 1),
+        start_date: range[0].format("YYYY-MM-DD"),
+        end_date: range[1].format("YYYY-MM-DD"),
       });
       const response = await fetch(`/api/daily-kpi-entries?${params}`);
       if (!response.ok) throw new Error(`Failed to fetch: ${response.statusText}`);
@@ -167,6 +253,10 @@ export default function DailyKpiManagement() {
       work_date: record.work_date ? dayjs(record.work_date) : undefined,
       work_type_id: record.work_type_id,
       daily_productivity: Number(record.daily_productivity ?? 0),
+      // null stays undefined (not 0) so a non-assigned vehicle's entry
+      // opens with the mileage fields blank rather than a misleading 0.00.
+      mileage: record.mileage != null ? Number(record.mileage) : undefined,
+      amount_per_km: record.amount_per_km != null ? Number(record.amount_per_km) : undefined,
       remarks: record.remarks,
     });
     setIsModalVisible(true);
@@ -180,6 +270,12 @@ export default function DailyKpiManagement() {
       const payload = {
         ...values,
         work_date: values.work_date ? values.work_date.format("YYYY-MM-DD") : undefined,
+        // Only send mileage figures for an assigned vehicle. total_amount is
+        // never sent -- the API recomputes it, and re-checks the Vehicle
+        // Group itself, so the stored row cannot disagree with Wialon.
+        ...(isAssignedVehicle
+          ? { mileage: values.mileage ?? 0, amount_per_km: values.amount_per_km ?? 0 }
+          : { mileage: null, amount_per_km: null }),
       };
       const response = await fetch(url, {
         method: isEditing ? "PUT" : "POST",
@@ -227,7 +323,8 @@ export default function DailyKpiManagement() {
     [workTypes, selectedWorkTypeId]
   );
 
-  const previewKpi = useMemo(() => {
+  // The work-type half of the KPI: LEAST(quantity, productivity) * rate.
+  const workTypeKpi = useMemo(() => {
     if (!selectedWorkType) return null;
     const quantity = Number(selectedWorkType.quantity ?? 0);
     const productivity = Number(dailyProductivity ?? 0);
@@ -235,6 +332,24 @@ export default function DailyKpiManagement() {
     const effective = quantity < productivity ? quantity : productivity;
     return effective * rate;
   }, [selectedWorkType, dailyProductivity]);
+
+  // Total Amount = Mileage x Amount per KM. Only meaningful for a vehicle
+  // whose Vehicle Group is "Assigned"; null otherwise, so the field shows
+  // blank rather than a 0.00 that looks like a real measurement.
+  const totalAmount = useMemo(() => {
+    if (!isAssignedVehicle) return null;
+    const km = Number(mileage ?? 0);
+    const rate = Number(amountPerKm ?? 0);
+    if (!Number.isFinite(km) || !Number.isFinite(rate) || km < 0 || rate < 0) return null;
+    return Math.round(km * rate * 100) / 100;
+  }, [isAssignedVehicle, mileage, amountPerKm]);
+
+  // Daily KPI (Preview) = work-type KPI + Total Amount. Mirrors _with_kpi
+  // on the backend, which recomputes the same sum when the entry is saved.
+  const previewKpi = useMemo(() => {
+    if (workTypeKpi == null) return null;
+    return Math.round((workTypeKpi + (totalAmount ?? 0)) * 100) / 100;
+  }, [workTypeKpi, totalAmount]);
 
   const columns = [
     {
@@ -319,6 +434,32 @@ export default function DailyKpiManagement() {
       render: money,
     },
     {
+      title: "Mileage",
+      dataIndex: "mileage",
+      key: "mileage",
+      width: 100,
+      // "-" not 0.00 -- an unassigned vehicle has no mileage terms at all,
+      // which is different from having driven zero km.
+      render: (v: any) => (v == null ? "-" : `${Number(v).toLocaleString()} km`),
+      sorter: (a: any, b: any) => Number(a.mileage ?? 0) - Number(b.mileage ?? 0),
+    },
+    {
+      title: "Amount per KM",
+      dataIndex: "amount_per_km",
+      key: "amount_per_km",
+      width: 120,
+      render: (v: any) => (v == null ? "-" : money(Number(v))),
+      sorter: (a: any, b: any) => Number(a.amount_per_km ?? 0) - Number(b.amount_per_km ?? 0),
+    },
+    {
+      title: "Total Amount",
+      dataIndex: "total_amount",
+      key: "total_amount",
+      width: 120,
+      render: (v: any) => (v == null ? "-" : money(Number(v))),
+      sorter: (a: any, b: any) => Number(a.total_amount ?? 0) - Number(b.total_amount ?? 0),
+    },
+    {
       title: "Daily KPI",
       dataIndex: "kpi",
       key: "kpi",
@@ -352,7 +493,7 @@ export default function DailyKpiManagement() {
   ];
 
   const handleExportExcel = async () => {
-    if (rows.length === 0) {
+    if (filteredRows.length === 0) {
       message.warning("There is no data to export.");
       return;
     }
@@ -384,7 +525,10 @@ export default function DailyKpiManagement() {
 
       sheet.mergeCells(1, 2, 1, totalColumns);
       const titleCell = sheet.getCell(1, 2);
-      titleCell.value = `Monthly Report - ${month.format("MMMM YYYY")}`;
+      titleCell.value =
+        range[0].isSame(range[1], "day")
+          ? `Daily KPI Report - ${range[0].format("DD-MMM-YYYY")}`
+          : `Daily KPI Report - ${range[0].format("DD-MMM-YYYY")} to ${range[1].format("DD-MMM-YYYY")}`;
       titleCell.font = { size: 16, bold: true };
       titleCell.alignment = { vertical: "middle", horizontal: "center" };
 
@@ -426,6 +570,12 @@ export default function DailyKpiManagement() {
             return record.unit || "";
           case "rate_per_unit":
             return Number(record.rate_per_unit ?? 0);
+          case "mileage":
+            return record.mileage == null ? "" : Number(record.mileage);
+          case "amount_per_km":
+            return record.amount_per_km == null ? "" : Number(record.amount_per_km);
+          case "total_amount":
+            return record.total_amount == null ? "" : Number(record.total_amount);
           case "kpi":
             return Number(record.kpi ?? 0);
           case "remarks":
@@ -435,7 +585,7 @@ export default function DailyKpiManagement() {
         }
       };
 
-      rows.forEach((record, index) => {
+      filteredRows.forEach((record, index) => {
         const row = sheet.getRow(currentRow);
         exportColumns.forEach((col, colIdx) => {
           const cell = row.getCell(colIdx + 1);
@@ -458,7 +608,7 @@ export default function DailyKpiManagement() {
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `Monthly_Report_${month.format("YYYY-MM")}.xlsx`;
+      link.download = `Daily_KPI_${range[0].format("YYYY-MM-DD")}_to_${range[1].format("YYYY-MM-DD")}.xlsx`;
       link.click();
       window.URL.revokeObjectURL(url);
       notifySuccess("Exported to Excel");
@@ -480,12 +630,22 @@ export default function DailyKpiManagement() {
       }
       extra={
         <Space>
-          <DatePicker
-            picker="month"
-            format="MMMM YYYY"
+          <Input
+            allowClear
+            prefix={<SearchOutlined />}
+            placeholder="Search vehicle code or plate number..."
+            value={vehicleSearch}
+            onChange={(e) => setVehicleSearch(e.target.value)}
+            style={{ width: 280 }}
+          />
+          <DatePicker.RangePicker
+            format="DD-MMM-YYYY"
             allowClear={false}
-            value={month}
-            onChange={(value) => value && setMonth(value.startOf("month"))}
+            value={range}
+            style={{ width: 260 }}
+            onChange={(values) => {
+              if (values?.[0] && values?.[1]) setRange([values[0], values[1]]);
+            }}
           />
           <Button icon={<ReloadOutlined />} onClick={() => loadRows()} />
           {canExport && (
@@ -495,7 +655,7 @@ export default function DailyKpiManagement() {
                 icon={<FileExcelOutlined />}
                 onClick={handleExportExcel}
                 loading={exportLoading}
-                disabled={rows.length === 0}
+                disabled={filteredRows.length === 0}
                 style={{ background: "#217346", borderColor: "#217346", color: "#fff" }}
               />
             </Tooltip>
@@ -533,7 +693,7 @@ export default function DailyKpiManagement() {
         size="small"
         loading={loading}
         columns={columns}
-        dataSource={rows}
+        dataSource={filteredRows}
         rowKey="entry_id"
         bordered
         scroll={{ x: "max-content" }}
@@ -560,7 +720,7 @@ export default function DailyKpiManagement() {
               showSearch
               optionFilterProp="label"
               placeholder="Select a vehicle..."
-              options={vehicleOptions.map((v) => ({ value: v.id, label: v.name }))}
+              options={vehicleSelectOptions(vehicleOptions)}
             />
           </Form.Item>
           <Form.Item
@@ -585,6 +745,75 @@ export default function DailyKpiManagement() {
             <InputNumber style={{ width: "100%" }} min={0} step={1} />
           </Form.Item>
 
+          {/* Mileage earnings apply only to vehicles whose Vehicle Group is
+              "Assigned". The fields stay VISIBLE but disabled for everything
+              else, so it is obvious why they cannot be filled in rather than
+              the row silently vanishing. */}
+          <Row gutter={12}>
+            <Col span={8}>
+              <Form.Item
+                name="mileage"
+                label="Mileage"
+                rules={[
+                  { type: "number", min: 0, message: "Mileage cannot be negative" },
+                  {
+                    required: isAssignedVehicle,
+                    message: "Mileage is required for an assigned vehicle",
+                  },
+                ]}
+                extra={
+                  groupLookupLoading
+                    ? "Checking vehicle group..."
+                    : isAssignedVehicle
+                      ? "Kilometres."
+                      : vehicleGroupNote(selectedVehicleId, vehicleGroup)
+                }
+              >
+                <InputNumber
+                  style={{ width: "100%" }}
+                  min={0}
+                  step={0.01}
+                  addonAfter={groupLookupLoading ? <LoadingOutlined /> : "km"}
+                  disabled={!isAssignedVehicle || groupLookupLoading}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={8}>
+              <Form.Item
+                name="amount_per_km"
+                label="Amount per KM"
+                rules={[
+                  { type: "number", min: 0, message: "Amount per KM cannot be negative" },
+                  {
+                    required: isAssignedVehicle,
+                    message: "Amount per KM is required for an assigned vehicle",
+                  },
+                ]}
+                extra={isAssignedVehicle ? "Price per kilometre." : undefined}
+              >
+                <InputNumber
+                  style={{ width: "100%" }}
+                  min={0}
+                  step={0.0001}
+                  prefix="$"
+                  disabled={!isAssignedVehicle || groupLookupLoading}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={8}>
+              {/* Read-only: Mileage x Amount per KM, recomputed live and
+                  again server-side on save. */}
+              <Form.Item label="Total Amount">
+                <InputNumber
+                  style={{ width: "100%", fontWeight: 600, color: "#051650" }}
+                  disabled
+                  value={totalAmount ?? undefined}
+                  prefix="$"
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+
           {selectedWorkType && (
             <Descriptions
               size="small"
@@ -595,7 +824,29 @@ export default function DailyKpiManagement() {
                 { key: "quantity", label: "Quantity", children: Number(selectedWorkType.quantity ?? 0).toLocaleString() },
                 { key: "unit", label: "Unit", children: selectedWorkType.unit },
                 { key: "rate", label: "Calculated Rate / Unit", children: money(selectedWorkType.rate_per_unit) },
-                { key: "kpi", label: "Daily KPI (preview)", children: previewKpi != null ? money(previewKpi) : "-" },
+                { key: "group", label: "Vehicle Group", children: vehicleGroup || "Not Assigned" },
+                // Both halves are shown, so the preview reads as a
+                // calculation rather than an unexplained number.
+                {
+                  key: "work_type_kpi",
+                  label: "Work Type KPI",
+                  children: workTypeKpi != null ? money(workTypeKpi) : "-",
+                },
+                {
+                  key: "total_amount",
+                  label: "Total Amount",
+                  children: totalAmount != null ? money(totalAmount) : "-",
+                },
+                {
+                  key: "kpi",
+                  label: "Daily KPI (preview)",
+                  children:
+                    previewKpi != null ? (
+                      <strong style={{ color: "#051650" }}>{money(previewKpi)}</strong>
+                    ) : (
+                      "-"
+                    ),
+                },
               ]}
             />
           )}

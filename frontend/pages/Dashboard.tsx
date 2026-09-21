@@ -48,7 +48,12 @@ const shortMoney = (v: number) => {
 
 const pct = (v: number | null | undefined) => (v === null || v === undefined ? "-" : `${v}%`);
 
-const EXPENSE_COLORS = { repair: "#1677ff", engine_oil: "#faad14", diesel: "#f5222d" };
+const EXPENSE_COLORS = {
+  repair: "#1677ff",
+  engine_oil: "#faad14",
+  diesel: "#f5222d",
+  other: "#722ed1",
+};
 
 // Matches the exact category enum strings used by /vehicles/expenses so
 // pie-slice clicks can deep-link straight to a pre-filtered list.
@@ -56,6 +61,7 @@ const EXPENSE_CATEGORY = {
   repair: "Repair Expenses / Maintenance Cost",
   engine_oil: "Engine Oil, Pump & Brake",
   diesel: "Diesel Fuel",
+  other: "Other Expense",
 };
 
 function darken(hex: string, amount = 0.35) {
@@ -146,15 +152,18 @@ function Pie3DChart({
   const ry = 55;
   const depth = 16;
 
+  // Every category keeps a legend row, including ones sitting at $0 --
+  // silently dropping a zero category makes it look like the category does
+  // not exist at all, which is indistinguishable from a bug. Only the SVG
+  // geometry skips them, since a 0-degree arc draws nothing anyway.
   let cumulative = 0;
-  const slices = data
-    .filter((d) => d.value > 0)
-    .map((d) => {
-      const startAngle = (cumulative / total) * 360;
-      cumulative += d.value;
-      const endAngle = (cumulative / total) * 360;
-      return { ...d, startAngle, endAngle, sharePct: (d.value / total) * 100 };
-    });
+  const legendRows = data.map((d) => {
+    const startAngle = (cumulative / total) * 360;
+    cumulative += d.value;
+    const endAngle = (cumulative / total) * 360;
+    return { ...d, startAngle, endAngle, sharePct: (d.value / total) * 100 };
+  });
+  const slices = legendRows.filter((d) => d.value > 0);
 
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
@@ -180,8 +189,8 @@ function Pie3DChart({
           />
         ))}
       </svg>
-      <div style={{ display: "flex", flexDirection: "column", gap: 10, minWidth: 160 }}>
-        {slices.map((s, i) => (
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, minWidth: 200 }}>
+        {legendRows.map((s, i) => (
           <div
             key={i}
             onClick={() => onSliceClick && s.key && onSliceClick(s.key)}
@@ -191,6 +200,9 @@ function Pie3DChart({
               gap: 8,
               fontSize: 12,
               cursor: onSliceClick ? "pointer" : "default",
+              // A category with nothing recorded is real information, but
+              // it should not compete visually with the ones that have.
+              opacity: s.value > 0 ? 1 : 0.55,
             }}
           >
             <span style={{ width: 10, height: 10, borderRadius: 2, background: s.color, display: "inline-block", flexShrink: 0 }} />
@@ -199,6 +211,22 @@ function Pie3DChart({
             <span style={{ color: "#999", fontSize: 11, minWidth: 40, textAlign: "right" }}>{s.sharePct.toFixed(1)}%</span>
           </div>
         ))}
+        {/* Reconciles the mix: the categories above must add up to this. */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: 12,
+            borderTop: "1px solid #f0f0f0",
+            paddingTop: 8,
+          }}
+        >
+          <span style={{ width: 10, flexShrink: 0 }} />
+          <span style={{ color: "#666", flex: 1, fontWeight: 600 }}>Total</span>
+          <span style={{ fontWeight: 700 }}>{money(total)}</span>
+          <span style={{ minWidth: 40 }} />
+        </div>
       </div>
     </div>
   );
@@ -368,6 +396,8 @@ export default function Dashboard() {
       { label: "Repair & maintenance", value: b.repair, color: EXPENSE_COLORS.repair, key: "repair" },
       { label: "Engine oil & brake", value: b.engine_oil, color: EXPENSE_COLORS.engine_oil, key: "engine_oil" },
       { label: "Diesel fuel", value: b.diesel, color: EXPENSE_COLORS.diesel, key: "diesel" },
+      // `other` is absent from older cached responses, hence the ?? 0.
+      { label: "Other expense", value: b.other ?? 0, color: EXPENSE_COLORS.other, key: "other" },
     ];
   }, [data]);
 

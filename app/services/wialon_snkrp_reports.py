@@ -2,7 +2,7 @@ import re
 import requests
 import json
 from fastapi import HTTPException
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -49,6 +49,49 @@ def get_employees_by_vehicle_ids(db: Session, vehicle_ids: list) -> dict:
     }
 
 
+# Columns on vehicle_operation_logs that arrived via later migrations, so
+# an install that has not run them yet must still be able to read the rest
+# of the row.
+#
+# working_hours and total_mileage are listed too, not because they are new
+# -- they are in the base schema -- but because an install can be at any
+# point in the migration history, and selecting a column that isn't there
+# costs the whole overlay. status likewise: it arrived with
+# vehicle_operation_logs_add_status.sql and is what soft delete flips.
+OPTIONAL_LOG_COLUMNS = (
+    "project_code",
+    "base_location",
+    "status",
+    "working_hours",
+    "total_mileage",
+)
+
+
+def _existing_optional_log_columns(db: Session) -> set:
+    """Which of OPTIONAL_LOG_COLUMNS this database actually has.
+
+    Returns an empty set if the catalogue itself cannot be read -- the
+    caller then selects NULL for all of them, which loses those two fields
+    but keeps times, mileage and fuel working."""
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'vehicle_operation_logs'
+                  AND COLUMN_NAME IN :names
+                """
+            ).bindparams(bindparam("names", expanding=True)),
+            {"names": list(OPTIONAL_LOG_COLUMNS)},
+        )
+        return {r[0] for r in rows}
+    except SQLAlchemyError as e:
+        print(f"DEBUG: could not inspect vehicle_operation_logs columns: {e}")
+        return set()
+
+
 def get_operation_logs_by_vehicle_ids(
     db: Session, vehicle_ids: list, start_date: str, end_date: str
 ) -> dict:
@@ -62,18 +105,29 @@ def get_operation_logs_by_vehicle_ids(
     one per day), so this aggregates per vehicle:
       - start_time: earliest start_time in the range
       - end_time: latest end_time in the range
-      - working_hours: computed as (end_time - start_time) in decimal
-        hours, using the aggregated start/end above -- NOT a sum of the
-        table's per-row working_hours column, so it always matches what's
-        displayed for Start Time/End Time.
+      - working_hours: SUM of the log's own working_hours column. Read,
+        not derived: the user enters this on the Vehicle Operation Log,
+        so recomputing it from start/end times would let the report
+        contradict the record it is reporting. None when no log in the
+        range has a value.
       - initial_mileage: earliest (lowest) odometer reading in the range
       - final_mileage: latest (highest) odometer reading in the range
-      - total_mileage: final_mileage - initial_mileage (matches the
-        table's own `distance_travelled` generated column, computed here
-        over the aggregated range instead of summed per-row)
+      - total_mileage: SUM of the log's own total_mileage column -- again
+        read, not derived. The form pre-fills it with final - initial but
+        the user may override it, and the override is the answer. Note
+        this is NOT the table's `distance_travelled` generated column,
+        which is the *implied* distance and may legitimately differ.
+        None when no log in the range has a value.
+
+    Only Active logs are counted. A soft-deleted log keeps its row, and
+    including it would report hours and kilometres the user has deleted.
       - fuel_filling_liters: summed across the range
       - remarks: all distinct remarks in the range joined with "; "
         (GROUP_CONCAT ignores NULLs/blank rows automatically)
+      - base_location: all distinct base locations in the range, joined
+        with "; ". Blank when no log in the range records one -- the Daily
+        Machinery Operation Report shows blank rather than substituting a
+        value from anywhere else.
       - project_code: all distinct project codes in the range joined with
         "; ". Normally the report is run for a single day, so this is just
         that day's code; over a wider range it lists every code the vehicle
@@ -91,59 +145,107 @@ def get_operation_logs_by_vehicle_ids(
     params["start_date"] = start_date
     params["end_date"] = end_date
 
-    def _build_query(with_project_code: bool):
-        project_code_select = (
-            "GROUP_CONCAT(DISTINCT NULLIF(TRIM(project_code), '') SEPARATOR '; ') AS project_code"
-            if with_project_code
-            else "NULL AS project_code"
-        )
-        return text(
-            f"""
-            SELECT vehicle_id,
-                   MIN(start_time) AS start_time,
-                   MAX(end_time) AS end_time,
-                   MIN(initial_mileage) AS initial_mileage,
-                   MAX(final_mileage) AS final_mileage,
-                   SUM(fuel_filling_liters) AS fuel_filling_liters,
-                   GROUP_CONCAT(DISTINCT remarks SEPARATOR '; ') AS remarks,
-                   {project_code_select}
-            FROM vehicle_operation_logs
-            WHERE vehicle_id IN ({placeholders})
-              AND operation_date BETWEEN :start_date AND :end_date
-            GROUP BY vehicle_id
-            """
-        )
+    # project_code and base_location were both added by later migrations.
+    # Asking the catalogue which ones exist is cheaper and more precise
+    # than running the full query and catching the failure: a single
+    # missing column would otherwise cost start/end time, mileage and fuel
+    # as collateral, and the two columns can be missing independently.
+    present = _existing_optional_log_columns(db)
 
-    try:
-        result = db.execute(_build_query(with_project_code=True), params)
-    except SQLAlchemyError as e:
-        # project_code is a late addition. If the migration
-        # (app/vehicle_operation_logs_add_project_code.sql) has not been run
-        # yet the column does not exist -- fall back to the query without it
-        # rather than losing start/end time, mileage and fuel as collateral.
-        print(f"DEBUG: project_code column missing, querying without it: {e}")
-        db.rollback()
-        result = db.execute(_build_query(with_project_code=False), params)
+    def _optional_select(column: str) -> str:
+        # GROUP_CONCAT DISTINCT because a date range can span several logs.
+        # NULLIF(TRIM(...), '') drops blanks so an empty value never
+        # contributes a stray "; " separator to the joined result.
+        if column in present:
+            return (
+                f"GROUP_CONCAT(DISTINCT NULLIF(TRIM({column}), '') SEPARATOR '; ') "
+                f"AS {column}"
+            )
+        return f"NULL AS {column}"
+
+    # Working Hours and Total Mileage are READ FROM THE LOG, not recomputed.
+    #
+    # Both used to be derived here -- working hours from MAX(end_time) -
+    # MIN(start_time), total mileage from MAX(final) - MIN(initial). That
+    # was right when the columns were generated, but both are now values
+    # the user enters and can override on the Vehicle Operation Log form.
+    # Deriving them meant the report could contradict the log it claims to
+    # be reporting: someone types 7.5 hours, the report shows 9.25.
+    #
+    # SUM, because a date range can cover several daily logs and the total
+    # for the range is their sum. The report is normally run for one day,
+    # where SUM is simply that day's figure.
+    #
+    # CAST because total_mileage was VARCHAR(50) before
+    # vehicle_operation_logs_add_base_location.sql converted it; CAST reads
+    # correctly either way. NULLIF(TRIM(...), '') stops an empty string
+    # from being coerced to a reading of zero kilometres.
+    hours_select = (
+        "SUM(working_hours) AS working_hours"
+        if "working_hours" in present
+        else "NULL AS working_hours"
+    )
+    mileage_select = (
+        "SUM(CAST(NULLIF(TRIM(total_mileage), '') AS DECIMAL(12,2))) AS total_mileage"
+        if "total_mileage" in present
+        else "NULL AS total_mileage"
+    )
+    # Soft-deleted logs must not feed the report. Without this a log the
+    # user deleted keeps contributing its hours and kilometres, which is
+    # exactly the "outdated value" case -- and it is invisible, because the
+    # Vehicle Operation Logs screen hides Inactive rows by default.
+    status_clause = "AND status = 'Active'" if "status" in present else ""
+
+    query = text(
+        f"""
+        SELECT vehicle_id,
+               MIN(start_time) AS start_time,
+               MAX(end_time) AS end_time,
+               {hours_select},
+               MIN(initial_mileage) AS initial_mileage,
+               MAX(final_mileage) AS final_mileage,
+               {mileage_select},
+               SUM(fuel_filling_liters) AS fuel_filling_liters,
+               GROUP_CONCAT(DISTINCT remarks SEPARATOR '; ') AS remarks,
+               {_optional_select('project_code')},
+               {_optional_select('base_location')}
+        FROM vehicle_operation_logs
+        WHERE vehicle_id IN ({placeholders})
+          AND operation_date BETWEEN :start_date AND :end_date
+          {status_clause}
+        GROUP BY vehicle_id
+        """
+    )
+    result = db.execute(query, params)
 
     logs = {}
     for row in result:
-        working_hours = 0.0
-        if row.start_time and row.end_time:
-            working_hours = round(
-                (row.end_time - row.start_time).total_seconds() / 3600, 2
-            )
         initial_mileage = float(row.initial_mileage) if row.initial_mileage is not None else 0.0
         final_mileage = float(row.final_mileage) if row.final_mileage is not None else 0.0
+        # None, not 0.0, when the log carries no value.
+        #
+        # "Nobody recorded this" and "the reading was zero" are different
+        # facts and the report has to be able to tell them apart -- 0.00 h
+        # against a vehicle that simply has no log for the day reads as a
+        # measurement, and someone will act on it. None travels through the
+        # API as null and the frontend renders it blank.
+        working_hours = (
+            round(float(row.working_hours), 2) if row.working_hours is not None else None
+        )
+        total_mileage = (
+            round(float(row.total_mileage), 2) if row.total_mileage is not None else None
+        )
         logs[row.vehicle_id] = {
             "start_time": row.start_time.isoformat() if row.start_time else "",
             "end_time": row.end_time.isoformat() if row.end_time else "",
             "working_hours": working_hours,
             "initial_mileage": initial_mileage,
             "final_mileage": final_mileage,
-            "total_mileage": round(final_mileage - initial_mileage, 2),
+            "total_mileage": total_mileage,
             "fuel_filling_liters": float(row.fuel_filling_liters) if row.fuel_filling_liters is not None else 0.0,
             "remarks": row.remarks or "",
             "project_code": row.project_code or "",
+            "base_location": row.base_location or "",
         }
     return logs
 

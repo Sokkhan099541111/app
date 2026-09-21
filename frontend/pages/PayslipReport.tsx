@@ -174,14 +174,14 @@ export default function PayslipReport() {
   const [loading, setLoading] = useState(false);
   const [exportLoading, setExportLoading] = useState(false);
   const [pdfLoading, setPdfLoading] = useState(false);
-  // Date-range filter (From Date / To Date) -- defaults to the current
-  // month so the report shows the current payroll data on first load,
-  // unless start_date/end_date are supplied via URL (dashboard drill-down).
+  // Date-range filter (From Date / To Date) -- defaults to today, unless
+  // start_date/end_date are supplied via URL (dashboard drill-down).
   const [filterDateRange, setFilterDateRange] = useState<[string, string]>(() => {
     const start = searchParams.get("start_date");
     const end = searchParams.get("end_date");
     if (start && end) return [start, end];
-    return [dayjs().startOf("month").format(DATE_FORMAT), dayjs().endOf("month").format(DATE_FORMAT)];
+    const today = dayjs().format(DATE_FORMAT);
+    return [today, today];
   });
   const [filterEmployee, setFilterEmployee] = useState<number | "all" | undefined>(undefined);
 

@@ -88,12 +88,54 @@ def run_fuel_report():
     return {"status": "success", "report": "fuel"}
 
 
+def _filter_by_vehicle_search(rows: list, keyword: Optional[str]) -> list:
+    """Keep rows whose Code OR Plate Number contains `keyword`.
+
+    Case-insensitive and whitespace-trimmed, so " abc " and "ABC" behave
+    the same as "abc" -- a keyword pasted from a spreadsheet usually
+    carries stray spaces, and dropping every result over one would look
+    like missing data rather than a typo.
+
+    A blank or missing keyword returns the rows untouched: "no search" is
+    not the same as "search for the empty string", which would match
+    everything by accident rather than by intent.
+
+    Filtering in Python rather than SQL because these rows do not come
+    from the database -- they are built from the Wialon unit list and then
+    enriched. The list is one entry per vehicle in the account (hundreds,
+    not millions) and is already fully in memory by this point, so this is
+    a single linear pass over data that has already been paid for; pushing
+    it into SQL would mean an extra round trip and still could not see
+    `code`, which the fleet report supplies.
+    """
+    if keyword is None:
+        return rows
+    needle = keyword.strip().lower()
+    if not needle:
+        return rows
+
+    return [
+        row
+        for row in rows
+        if needle in str(row.get("code") or "").lower()
+        or needle in str(row.get("plate") or "").lower()
+    ]
+
+
 @router.get("/reports/vehicles")
 def get_vehicle_list(
     company_id: int = Query(DEFAULT_COMPANY_ID, description="Company whose Wialon credentials to use"),
     groupId: Optional[int] = Query(None, description="avl_unit_group ID to filter by"),
     start: Optional[str] = Query(None, description="Start date (currently unused, see note below)"),
     end: Optional[str] = Query(None, description="End date (currently unused, see note below)"),
+    vehicle_search: Optional[str] = Query(
+        None,
+        description=(
+            "Partial, case-insensitive match against the vehicle Code OR the "
+            "Plate Number. Blank/omitted returns every vehicle the other "
+            "filters allow."
+        ),
+    ),
     db: Session = Depends(get_db),
 ):
     """
@@ -154,6 +196,17 @@ def get_vehicle_list(
         # block below, so nothing downstream can overwrite it. The Vehicle
         # Operation Log is the ONLY source for that column.
         project_code_from_log: dict = {}
+        # Base Location is collected the same way and for the same reason:
+        # the Vehicle Operation Log is now its ONLY source, so it is applied
+        # after the fleet-report block rather than inside it.
+        base_location_from_log: dict = {}
+        # Working Hours and Total Mileage get the same treatment, and for
+        # the same reason: the Vehicle Operation Log is their only source.
+        # Collected here, applied after the fleet-report block, so a
+        # vehicle with no log reads BLANK rather than falling back to the
+        # Wialon-derived engine hours / mileage sitting in other columns.
+        working_hours_from_log: dict = {}
+        total_mileage_from_log: dict = {}
 
         if start and end:
             try:
@@ -165,12 +218,16 @@ def get_vehicle_list(
                     if log:
                         if log.get("project_code"):
                             project_code_from_log[row["key"]] = log["project_code"]
+                        if log.get("base_location"):
+                            base_location_from_log[row["key"]] = log["base_location"]
+                        if log.get("working_hours") is not None:
+                            working_hours_from_log[row["key"]] = log["working_hours"]
+                        if log.get("total_mileage") is not None:
+                            total_mileage_from_log[row["key"]] = log["total_mileage"]
                         row["startTime"] = log["start_time"]
                         row["endTime"] = log["end_time"]
-                        row["workingHours"] = log["working_hours"]
                         row["initialMileage"] = log["initial_mileage"]
                         row["finalMileage"] = log["final_mileage"]
-                        row["totalMileage"] = log["total_mileage"]
                         row["fuelFilledLiters"] = log["fuel_filling_liters"]
                         row["remarks"] = log["remarks"]
             except Exception as log_err:
@@ -179,8 +236,11 @@ def get_vehicle_list(
                 print(f"DEBUG: operation logs join failed: {log_err}")
 
         # Overlay the Rental Attendance Entry status per vehicle for the
-        # selected date range. This drives the Remark column of the Daily
-        # Machinery Operation Report, so it runs for EVERY vehicle in the
+        # selected date range. This drives the Status column of the Daily
+        # Machinery Operation Report (renamed from "Remark" -- the column
+        # always showed a status, and "Remark" is now a separate free-text
+        # field carried on the operation log), so it runs for EVERY vehicle
+        # in the
         # list -- independently of whether that vehicle has an operation
         # log -- and leaves the field empty when no attendance exists, which
         # the frontend renders as "No Action".
@@ -216,7 +276,11 @@ def get_vehicle_list(
                         row["code"] = metrics["code"]
                         row["vehicleTypeEng"] = metrics["vehicleTypeEng"]
                         row["vehicleTypeKh"] = metrics["vehicleTypeKh"]
-                        row["baseLocation"] = metrics["baseLocation"]
+                        # NOTE: baseLocation is deliberately NOT taken from the
+                        # fleet report any more, for the same reason as
+                        # projectCode below -- users now enter it on the
+                        # Vehicle Operation Log, and that record is the single
+                        # source of truth. See the block after this loop.
                         # NOTE: projectCode is deliberately NOT taken from the
                         # fleet report any more. Project Code is now entered by
                         # users on the Vehicle Operation Log, and that record is
@@ -243,8 +307,29 @@ def get_vehicle_list(
         # showing a value that does not exist on any log record.
         for row in rows:
             row["projectCode"] = project_code_from_log.get(row["key"], "")
+            # Same contract for Base Location: assigned unconditionally, so a
+            # vehicle with no operation log -- or a log predating the
+            # base_location column -- reads blank. Blank is the honest answer;
+            # falling back to the fleet report would show a location that
+            # appears on no log record and cannot be corrected from the UI.
+            row["baseLocation"] = base_location_from_log.get(row["key"], "")
+            # Working Hours and Total Mileage: None, not 0, when no log in
+            # the range recorded one. Assigned unconditionally like the two
+            # above, so nothing earlier in the pipeline can leave a stale
+            # or Wialon-derived number in these columns. None serialises to
+            # null and the report renders it blank -- "0.00 h" against a
+            # vehicle that was never logged looks like a measurement, and
+            # someone will act on it.
+            row["workingHours"] = working_hours_from_log.get(row["key"])
+            row["totalMileage"] = total_mileage_from_log.get(row["key"])
 
-        return rows
+        # Vehicle search is applied LAST, once every overlay has run.
+        #
+        # It has to be: `code` does not exist on the raw unit -- it is
+        # overlaid from the fleet report further up -- so filtering any
+        # earlier would match against an empty string and silently drop
+        # every vehicle whose code the user was searching for.
+        return _filter_by_vehicle_search(rows, vehicle_search)
 
     except HTTPException:
         raise
